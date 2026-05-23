@@ -9,9 +9,11 @@ import {
   type AutoMMEntry,
   buildAutoMMMessage,
   formatMMContent,
+  getPromptTagBoost,
   injectAutoMM,
   type MentalModelMeta,
   selectMentalModels,
+  tagBoostCandidates,
 } from "../src/auto-mm";
 import { collectInjectedMMIds } from "../src/index";
 
@@ -134,6 +136,157 @@ describe("selectMentalModels", () => {
     expect(selected.length).toBe(1);
   });
 
+  describe("tag-value prompt boost", () => {
+    it("boosts MM count when prompt mentions the tag value", () => {
+      // Splitlify has only 3 tagged items — below count threshold (10) and
+      // ratio threshold (3/50 = 0.06). Without boost it would lose to other MMs.
+      const results: Array<{ id: string; text: string; tags: string[] }> = [];
+      for (let i = 0; i < 3; i++) results.push(item(["customer:400-splitlify"]));
+      for (let i = 0; i < 15; i++) results.push(item(["customer:110-hany"]));
+      for (let i = 0; i < 12; i++) results.push(item(["customer:401-iamsick"]));
+      while (results.length < 50) results.push(item([]));
+
+      const mms = [
+        mm("splitlify", ["customer:400-splitlify"], "Splitlify"),
+        mm("hany", ["customer:110-hany"], "Hany"),
+        mm("iamsick", ["customer:401-iamsick"], "iamsick"),
+      ];
+
+      // Without boost: hany wins, iamsick wins, splitlify loses (below threshold)
+      const noBoost = selectMentalModels(
+        results,
+        mms,
+        { ...defaultConfig, autoMMTopK: 2 },
+        "Tell me about splitlify status"
+      );
+      // No boost configured → splitlify still loses
+      expect(noBoost.selected.map((s) => s.meta.id).sort()).toEqual(["hany", "iamsick"]);
+
+      // With boost: splitlify gets +20 boost, total 23 — beats hany (15) and iamsick (12)
+      const boosted = selectMentalModels(
+        results,
+        mms,
+        { ...defaultConfig, autoMMTopK: 2, autoMMTagBoostAmount: 20 },
+        "Tell me about splitlify status"
+      );
+      expect(boosted.selected[0]?.meta.id).toBe("splitlify");
+      expect(boosted.selected[0]?.boost).toBe(20);
+      // Second slot: hany (15) beats iamsick (12)
+      expect(boosted.selected[1]?.meta.id).toBe("hany");
+    });
+
+    it("boost is case-insensitive", () => {
+      const results = [item(["customer:400-splitlify"])];
+      const mms = [mm("sl", ["customer:400-splitlify"])];
+
+      const result = selectMentalModels(
+        results,
+        mms,
+        {
+          ...defaultConfig,
+          autoMMTopK: 1,
+          autoMMMinMatchCount: 100, // force boost to be the only thing that passes
+          autoMMMinMatchRatio: 1.0,
+          autoMMTagBoostAmount: 50,
+        },
+        "What is SPLITLIFY?"
+      );
+      expect(result.selected.length).toBe(1);
+      expect(result.selected[0]?.boost).toBe(50);
+    });
+
+    it("no boost when prompt doesn't mention the tag value", () => {
+      const results = [item(["customer:400-splitlify"])];
+      const mms = [mm("sl", ["customer:400-splitlify"])];
+
+      const result = selectMentalModels(
+        results,
+        mms,
+        {
+          ...defaultConfig,
+          autoMMTopK: 1,
+          autoMMMinMatchCount: 1,
+          autoMMTagBoostAmount: 20,
+        },
+        "Tell me about hany topology"
+      );
+      expect(result.selected.length).toBe(1);
+      expect(result.selected[0]?.boost).toBe(0);
+    });
+
+    it("no boost when boost amount is 0", () => {
+      const results = [item(["customer:400-splitlify"])];
+      const mms = [mm("sl", ["customer:400-splitlify"])];
+
+      const result = selectMentalModels(
+        results,
+        mms,
+        {
+          ...defaultConfig,
+          autoMMTopK: 1,
+          autoMMMinMatchCount: 1,
+          autoMMTagBoostAmount: 0,
+        },
+        "splitlify"
+      );
+      expect(result.selected[0]?.boost).toBe(0);
+    });
+
+    it("no boost when userPrompt is omitted", () => {
+      const results = [item(["customer:400-splitlify"])];
+      const mms = [mm("sl", ["customer:400-splitlify"])];
+
+      const result = selectMentalModels(results, mms, {
+        ...defaultConfig,
+        autoMMTopK: 1,
+        autoMMMinMatchCount: 1,
+        autoMMTagBoostAmount: 20,
+      });
+      expect(result.selected[0]?.boost).toBe(0);
+    });
+
+    it("matches on component of tag value (e.g. 'hany' in '110-hany')", () => {
+      const result = getPromptTagBoost(
+        ["customer:110-hany"],
+        "where does rails on hany-01 resolve?",
+        20
+      );
+      expect(result).toBe(20);
+    });
+
+    it("matches on full tag value (e.g. '400-splitlify')", () => {
+      const result = getPromptTagBoost(
+        ["customer:400-splitlify"],
+        "look up 400-splitlify metrics",
+        15
+      );
+      expect(result).toBe(15);
+    });
+
+    it("ignores components shorter than 3 chars to avoid noise", () => {
+      // "v3" appears in many tags — make sure a tag like "version:v3" doesn't
+      // boost on every prompt that mentions "v3".
+      const candidates = tagBoostCandidates("version:v3");
+      // "v3" should be excluded (length 2), but "version:v3" value is "v3" itself
+      // which equals the full value — also length 2, also excluded.
+      expect(candidates).toEqual([]);
+    });
+
+    it("tagBoostCandidates splits on - _ . and includes the full value", () => {
+      expect([...new Set(tagBoostCandidates("customer:400-splitlify"))].sort()).toEqual(
+        ["400", "400-splitlify", "splitlify"].sort()
+      );
+      // "us" is dropped (len < 3)
+      expect([...new Set(tagBoostCandidates("env:prod_us_east"))].sort()).toEqual(
+        ["east", "prod", "prod_us_east"].sort()
+      );
+      // Tag without ':' has no value to extract
+      expect(tagBoostCandidates("noseparator")).toEqual([]);
+      // Empty value after ':'
+      expect(tagBoostCandidates("k:")).toEqual([]);
+    });
+  });
+
   it("matches handoff Appendix-A data (hany vs iamsick on multi-host comparison)", () => {
     // Synthesize a workload like cc02 (multi-host comparison):
     // 78 items, hany=21, iamsick=16, others trace amounts
@@ -237,10 +390,9 @@ describe("injectAutoMM", () => {
       item(["customer:110-hany"]),
       item(["customer:110-hany"]),
     ];
-    const client = makeClient(
-      [mm("hany", ["customer:110-hany"], "Hany Handbook")],
-      { hany: "## hany content body" }
-    );
+    const client = makeClient([mm("hany", ["customer:110-hany"], "Hany Handbook")], {
+      hany: "## hany content body",
+    });
     const audits: AutoMMEntry[] = [];
     const result = await injectAutoMM({
       client,
@@ -287,10 +439,7 @@ describe("injectAutoMM", () => {
     await injectAutoMM({
       client,
       // Only 1 of 10 items has the tag; ratio 0.1, count 1. Both thresholds fail.
-      recallResults: [
-        item(["x"]),
-        ...Array.from({ length: 9 }, () => item([])),
-      ],
+      recallResults: [item(["x"]), ...Array.from({ length: 9 }, () => item([]))],
       config: {
         ...defaultConfig,
         autoMMMinMatchCount: 5,
@@ -317,8 +466,18 @@ describe("collectInjectedMMIds", () => {
           customType: "hindsight-mm",
           details: {
             selected: [
-              { id: "customer-110-hany-handbook", name: "Hany", matchCount: 5, contentLength: 1000 },
-              { id: "customer-401-iamsick-handbook", name: "iamsick", matchCount: 3, contentLength: 800 },
+              {
+                id: "customer-110-hany-handbook",
+                name: "Hany",
+                matchCount: 5,
+                contentLength: 1000,
+              },
+              {
+                id: "customer-401-iamsick-handbook",
+                name: "iamsick",
+                matchCount: 3,
+                contentLength: 800,
+              },
             ],
             body: "fenced body",
           },

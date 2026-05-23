@@ -100,6 +100,8 @@ export interface HindsightConfig {
   autoMMMinMatchCount: number;
   autoMMMinMatchRatio: number;
   autoMMDisplay: boolean;
+  autoMMTagBoostAmount: number;
+  autoMMToolCallBudget: number;
   retainContent: RetainContent;
   strip: StripConfig;
   toolFilter: ToolFilter;
@@ -141,6 +143,8 @@ const DEFAULT_CONFIG: HindsightConfig = {
   autoMMMinMatchCount: 10,
   autoMMMinMatchRatio: 0.2,
   autoMMDisplay: true,
+  autoMMTagBoostAmount: 20,
+  autoMMToolCallBudget: 20,
   retainContent: {
     assistant: ["text", "thinking", "toolCall"],
     user: ["text"],
@@ -201,6 +205,8 @@ const VALID_CONFIG_KEYS = new Set<keyof HindsightConfig>([
   "autoMMMinMatchCount",
   "autoMMMinMatchRatio",
   "autoMMDisplay",
+  "autoMMTagBoostAmount",
+  "autoMMToolCallBudget",
   "retainContent",
   "strip",
   "toolFilter",
@@ -537,7 +543,9 @@ function setConfigValue(
     case "hindsightContextMaxLength":
     case "recallMaxQueryChars":
     case "autoMMTopK":
-    case "autoMMMinMatchCount": {
+    case "autoMMMinMatchCount":
+    case "autoMMTagBoostAmount":
+    case "autoMMToolCallBudget": {
       if (typeof value === "number") {
         config[key] = value;
         return;
@@ -1115,6 +1123,8 @@ export function loadConfig(extensionsDir?: string): {
     PI_HINDSIGHT_AUTO_MM_MIN_MATCH_COUNT: "autoMMMinMatchCount",
     PI_HINDSIGHT_AUTO_MM_MIN_MATCH_RATIO: "autoMMMinMatchRatio",
     PI_HINDSIGHT_AUTO_MM_DISPLAY: "autoMMDisplay",
+    PI_HINDSIGHT_AUTO_MM_TAG_BOOST_AMOUNT: "autoMMTagBoostAmount",
+    PI_HINDSIGHT_AUTO_MM_TOOL_CALL_BUDGET: "autoMMToolCallBudget",
     PI_HINDSIGHT_FLUSH_ON_COMPACT: "flushOnCompact",
     PI_HINDSIGHT_RETAIN_SESSIONS_BY_DEFAULT: "retainSessionsByDefault",
     PI_HINDSIGHT_RETAIN_CONTENT: "retainContent",
@@ -1239,6 +1249,18 @@ export function validateConfig(config: HindsightConfig): {
       `autoMMMinMatchRatio must be between 0 and 1. Using default: ${DEFAULT_CONFIG.autoMMMinMatchRatio}.`
     );
     config.autoMMMinMatchRatio = DEFAULT_CONFIG.autoMMMinMatchRatio;
+  }
+  if (config.autoMMTagBoostAmount < 0) {
+    warnings.push(
+      `autoMMTagBoostAmount must be >= 0. Using default: ${DEFAULT_CONFIG.autoMMTagBoostAmount}.`
+    );
+    config.autoMMTagBoostAmount = DEFAULT_CONFIG.autoMMTagBoostAmount;
+  }
+  if (config.autoMMToolCallBudget < 0) {
+    warnings.push(
+      `autoMMToolCallBudget must be >= 0. Using default: ${DEFAULT_CONFIG.autoMMToolCallBudget}.`
+    );
+    config.autoMMToolCallBudget = DEFAULT_CONFIG.autoMMToolCallBudget;
   }
 
   // Valid content types per retainContent role

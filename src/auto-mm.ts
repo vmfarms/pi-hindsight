@@ -30,6 +30,8 @@ export interface SelectedMentalModel {
   meta: MentalModelMeta;
   matchCount: number;
   matchRatio: number;
+  /** Boost applied to matchCount when the prompt mentions the MM's tag value (under-rep boost). */
+  boost?: number;
 }
 
 /** Result of fetching a selected MM's content, ready to inject. */
@@ -42,6 +44,12 @@ export interface AutoMMSelectionConfig {
   autoMMTopK: number;
   autoMMMinMatchCount: number;
   autoMMMinMatchRatio: number;
+  /**
+   * If >0, MMs whose tag-value appears in the user prompt get +boost on matchCount
+   * before threshold/sort. Helps thin-footprint entities (e.g. a customer with
+   * few recall items) win selection when the prompt explicitly names them.
+   */
+  autoMMTagBoostAmount?: number;
 }
 
 /** Audit-trail entry written via pi.appendEntry. */
@@ -55,13 +63,56 @@ export interface AutoMMEntry {
     matchCount: number;
     matchRatio: number;
     contentLength: number;
+    boost?: number;
   }>;
   considered: Array<{
     id: string;
     matchCount: number;
     matchRatio: number;
     passedThreshold: boolean;
+    boost?: number;
   }>;
+}
+
+/**
+ * For a tag like "customer:400-splitlify", extract candidate strings to match
+ * against the prompt: the full value ("400-splitlify") and each component
+ * after splitting on `- _ .` ("400", "splitlify"). Components shorter than 3
+ * chars are dropped to avoid spurious matches on tokens like "v3".
+ *
+ * Exported for testing.
+ */
+export function tagBoostCandidates(tag: string): string[] {
+  const idx = tag.indexOf(":");
+  if (idx < 0 || idx === tag.length - 1) return [];
+  const value = tag.slice(idx + 1);
+  const parts = [value, ...value.split(/[-_.]/)];
+  return parts.filter((p) => p.length >= 3);
+}
+
+/**
+ * Boost an MM's matchCount if any of its tag-values (or components thereof)
+ * appear in the user prompt. Used to help thin-footprint entities win
+ * selection when the prompt explicitly names them.
+ *
+ * Returns 0 if no userPrompt, boost amount is 0, or no tag matches.
+ *
+ * Exported for testing.
+ */
+export function getPromptTagBoost(
+  mmTags: ReadonlyArray<string>,
+  promptLower: string,
+  boostAmount: number
+): number {
+  if (boostAmount <= 0 || !promptLower) return 0;
+  for (const tag of mmTags) {
+    for (const candidate of tagBoostCandidates(tag)) {
+      if (promptLower.includes(candidate.toLowerCase())) {
+        return boostAmount;
+      }
+    }
+  }
+  return 0;
 }
 
 /**
@@ -69,12 +120,16 @@ export interface AutoMMEntry {
  * top-K MMs by tag-intersection match count, gated by absolute count and ratio
  * thresholds.
  *
+ * If `userPrompt` is provided and `autoMMTagBoostAmount > 0`, MMs whose tag
+ * values appear in the prompt receive a count boost before threshold/sort.
+ *
  * Exported for unit testing.
  */
 export function selectMentalModels(
   recallResults: ReadonlyArray<RecallResponse["results"][number]>,
   allMMs: ReadonlyArray<MentalModelMeta>,
-  config: AutoMMSelectionConfig
+  config: AutoMMSelectionConfig,
+  userPrompt?: string
 ): {
   selected: SelectedMentalModel[];
   considered: Array<{
@@ -82,6 +137,7 @@ export function selectMentalModels(
     matchCount: number;
     matchRatio: number;
     passedThreshold: boolean;
+    boost: number;
   }>;
 } {
   const considered: Array<{
@@ -89,6 +145,7 @@ export function selectMentalModels(
     matchCount: number;
     matchRatio: number;
     passedThreshold: boolean;
+    boost: number;
   }> = [];
 
   if (recallResults.length === 0 || allMMs.length === 0 || config.autoMMTopK <= 0) {
@@ -99,12 +156,21 @@ export function selectMentalModels(
   // rather than a linear scan.
   const itemTagSets = recallResults.map((r) => new Set(r.tags ?? []));
 
+  const boostAmount = config.autoMMTagBoostAmount ?? 0;
+  const promptLower = userPrompt?.toLowerCase() ?? "";
+
   const candidates: SelectedMentalModel[] = [];
   for (const mm of allMMs) {
     // MMs with no tag filter would match every item and dominate selection.
     // Skip them — they're not useful for tag-routed injection.
     if (!mm.tags || mm.tags.length === 0) {
-      considered.push({ meta: mm, matchCount: 0, matchRatio: 0, passedThreshold: false });
+      considered.push({
+        meta: mm,
+        matchCount: 0,
+        matchRatio: 0,
+        passedThreshold: false,
+        boost: 0,
+      });
       continue;
     }
 
@@ -120,14 +186,18 @@ export function selectMentalModels(
       if (allPresent) matchCount++;
     }
 
-    const matchRatio = matchCount / recallResults.length;
+    const boost = getPromptTagBoost(mm.tags, promptLower, boostAmount);
+    const effectiveCount = matchCount + boost;
+    // Ratio uses effective count so a thin-footprint MM mentioned in the prompt
+    // can clear the ratio gate too.
+    const matchRatio = effectiveCount / recallResults.length;
     const passedThreshold =
-      matchCount >= config.autoMMMinMatchCount || matchRatio >= config.autoMMMinMatchRatio;
+      effectiveCount >= config.autoMMMinMatchCount || matchRatio >= config.autoMMMinMatchRatio;
 
-    considered.push({ meta: mm, matchCount, matchRatio, passedThreshold });
+    considered.push({ meta: mm, matchCount: effectiveCount, matchRatio, passedThreshold, boost });
 
     if (passedThreshold) {
-      candidates.push({ meta: mm, matchCount, matchRatio });
+      candidates.push({ meta: mm, matchCount: effectiveCount, matchRatio, boost });
     }
   }
 
@@ -211,13 +281,15 @@ export async function injectAutoMM(opts: {
   config: AutoMMSelectionConfig & { autoMMEnabled: boolean; autoMMDisplay: boolean };
   signal?: AbortSignal;
   mmListCache?: ReadonlyArray<MentalModelMeta>;
+  /** User prompt — used by tag-value boost to favor MMs explicitly named in the prompt. */
+  userPrompt?: string;
   /** Called once with the audit-trail entry, regardless of whether a message is built. */
   onAudit?: (entry: AutoMMEntry) => void;
 }): Promise<{
   message: AutoMMMessage | null;
   mmList: MentalModelMeta[] | null;
 }> {
-  const { client, recallResults, config, signal, mmListCache, onAudit } = opts;
+  const { client, recallResults, config, signal, mmListCache, userPrompt, onAudit } = opts;
 
   if (!config.autoMMEnabled) return { message: null, mmList: null };
   if (recallResults.length === 0) return { message: null, mmList: null };
@@ -235,7 +307,7 @@ export async function injectAutoMM(opts: {
     mmList = listResult.items;
   }
 
-  const { selected, considered } = selectMentalModels(recallResults, mmList, config);
+  const { selected, considered } = selectMentalModels(recallResults, mmList, config, userPrompt);
 
   if (selected.length === 0) {
     onAudit?.({
@@ -248,6 +320,7 @@ export async function injectAutoMM(opts: {
         matchCount: c.matchCount,
         matchRatio: c.matchRatio,
         passedThreshold: c.passedThreshold,
+        boost: c.boost,
       })),
     });
     return { message: null, mmList };
@@ -259,9 +332,7 @@ export async function injectAutoMM(opts: {
     selected.map(async (sel) => {
       const res = await client.getMentalModel(sel.meta.id, signal);
       if (!res.success) {
-        console.warn(
-          `pi-hindsight: autoMM failed to fetch MM ${sel.meta.id}: ${res.error}`
-        );
+        console.warn(`pi-hindsight: autoMM failed to fetch MM ${sel.meta.id}: ${res.error}`);
         return;
       }
       const body = (res.content ?? "").trim();
@@ -285,12 +356,14 @@ export async function injectAutoMM(opts: {
       matchCount: f.matchCount,
       matchRatio: f.matchRatio,
       contentLength: f.content.length,
+      boost: f.boost,
     })),
     considered: considered.map((c) => ({
       id: c.meta.id,
       matchCount: c.matchCount,
       matchRatio: c.matchRatio,
       passedThreshold: c.passedThreshold,
+      boost: c.boost,
     })),
   });
 

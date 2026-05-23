@@ -45,6 +45,8 @@ export const testConfig: HindsightConfig = {
   autoMMMinMatchCount: 10,
   autoMMMinMatchRatio: 0.2,
   autoMMDisplay: true,
+  autoMMTagBoostAmount: 0,
+  autoMMToolCallBudget: 0,
   retainContent: { assistant: ["text"], user: ["text"], toolResult: [] },
   strip: { topLevel: ["type"], message: ["api"] },
   toolFilter: {},

@@ -28,6 +28,7 @@ import { getHindsightMeta, shouldSessionBeRetained } from "./meta";
 import { prepareEntry, shouldRetainMessage } from "./prepare";
 import { enqueueAutoMessage } from "./queue";
 import { flushQueues, getQueueCount } from "./retention";
+import { ToolBudget } from "./tool-budget";
 import { isToolEnabled, registerTools, updateRetainToolVisibility } from "./tools";
 import { extractParentSessionId, getProjectName, getSessionDisplayName, truncate } from "./utils";
 
@@ -50,6 +51,11 @@ let lastAutoMMMessage: AutoMMMessage | null = null;
 // each turn. Invalidated on session_start.
 let mmListCache: MentalModelMeta[] | null = null;
 
+// Per-turn tool-call budget — enforces a cap when autoMM injected a handbook
+// for the current turn. Module-scoped (mirrors lastAutoMMMessage etc.) and
+// reset at turn boundaries.
+const toolBudget = new ToolBudget();
+
 /**
  * Reset module-level mutable state. Exported for testing only.
  */
@@ -59,6 +65,7 @@ export function _resetState(): void {
   lastRecallDetails = null;
   lastAutoMMMessage = null;
   mmListCache = null;
+  toolBudget.beginTurn();
 }
 
 /**
@@ -229,6 +236,11 @@ export default function (pi: ExtensionAPI) {
   // Always performs recall and caches the result for the context handler to re-inject.
   // Only returns the message (persisting it to session) when autoRecallPersist is true.
   pi.on("before_agent_start", async (event, ctx: ExtensionContext) => {
+    // Reset per-turn tool budget at the start of every turn, regardless of
+    // whether recall fires. The flag for "MM injected this turn" is set below
+    // only when autoMM actually injects.
+    toolBudget.beginTurn();
+
     if (!client || !config.autoRecallEnabled) return;
 
     // Use event.prompt directly — available before the user message is
@@ -286,9 +298,11 @@ export default function (pi: ExtensionAPI) {
               autoMMMinMatchCount: config.autoMMMinMatchCount,
               autoMMMinMatchRatio: config.autoMMMinMatchRatio,
               autoMMDisplay: config.autoMMDisplay,
+              autoMMTagBoostAmount: config.autoMMTagBoostAmount,
             },
             signal: ctx.signal,
             mmListCache: mmListCache ?? undefined,
+            userPrompt: query,
             onAudit: (entry) => pi.appendEntry<AutoMMEntry>("hindsight-mm-audit", entry),
           });
           if (mmResult.mmList) mmListCache = mmResult.mmList;
@@ -304,6 +318,9 @@ export default function (pi: ExtensionAPI) {
             } else if (newSelected.length === mmResult.message.details.selected.length) {
               // No filtering needed — inject the full message.
               lastAutoMMMessage = mmResult.message;
+              // Mark this turn as having a handbook in context so the tool-call
+              // budget kicks in for subsequent tool invocations.
+              toolBudget.markMMInjected();
               pi.sendMessage(
                 {
                   customType: "hindsight-mm",
@@ -394,6 +411,20 @@ export default function (pi: ExtensionAPI) {
     // If we filtered out recall messages but didn't re-inject, return filtered array
     if (hadRecallMessages) {
       return { messages: filteredMessages } as Record<string, unknown>;
+    }
+  });
+
+  // Per-turn tool-call budget enforcement. When autoMM injected a handbook
+  // for the current turn (toolBudget.markMMInjected was called), cap the
+  // number of tool calls. Blocked calls become an error tool result with the
+  // reason text, nudging the model back to the handbook content.
+  pi.on("tool_call", async (_event) => {
+    if (!config.autoMMEnabled || config.autoMMToolCallBudget <= 0) return;
+    const decision = toolBudget.decide({
+      autoMMToolCallBudget: config.autoMMToolCallBudget,
+    });
+    if (decision.block) {
+      return { block: true, reason: decision.reason };
     }
   });
 
