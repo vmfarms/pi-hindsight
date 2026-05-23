@@ -95,6 +95,11 @@ export interface HindsightConfig {
   autoRecallTagsMatch: TagsMatch;
   autoRecallTagGroups: TagGroupInput[] | null;
   constantTags: string[];
+  autoMMEnabled: boolean;
+  autoMMTopK: number;
+  autoMMMinMatchCount: number;
+  autoMMMinMatchRatio: number;
+  autoMMDisplay: boolean;
   retainContent: RetainContent;
   strip: StripConfig;
   toolFilter: ToolFilter;
@@ -131,6 +136,11 @@ const DEFAULT_CONFIG: HindsightConfig = {
   autoRecallTagsMatch: "any",
   autoRecallTagGroups: null,
   constantTags: ["harness:pi"],
+  autoMMEnabled: false,
+  autoMMTopK: 2,
+  autoMMMinMatchCount: 10,
+  autoMMMinMatchRatio: 0.2,
+  autoMMDisplay: true,
   retainContent: {
     assistant: ["text", "thinking", "toolCall"],
     user: ["text"],
@@ -186,6 +196,11 @@ const VALID_CONFIG_KEYS = new Set<keyof HindsightConfig>([
   "autoRecallTagsMatch",
   "autoRecallTagGroups",
   "constantTags",
+  "autoMMEnabled",
+  "autoMMTopK",
+  "autoMMMinMatchCount",
+  "autoMMMinMatchRatio",
+  "autoMMDisplay",
   "retainContent",
   "strip",
   "toolFilter",
@@ -495,6 +510,8 @@ function setConfigValue(
     case "autoRecallShowDateTime":
     case "autoRecallDisplay":
     case "autoRecallPersist":
+    case "autoMMEnabled":
+    case "autoMMDisplay":
     case "retainSessionsByDefault":
     case "flushOnCompact": {
       if (typeof value === "boolean") {
@@ -518,7 +535,9 @@ function setConfigValue(
       );
     }
     case "hindsightContextMaxLength":
-    case "recallMaxQueryChars": {
+    case "recallMaxQueryChars":
+    case "autoMMTopK":
+    case "autoMMMinMatchCount": {
       if (typeof value === "number") {
         config[key] = value;
         return;
@@ -526,6 +545,19 @@ function setConfigValue(
       const result = parseNumber(String(value), DEFAULT_CONFIG[key] as number, key);
       config[key] = result.value ?? (DEFAULT_CONFIG[key] as number);
       return result.warning;
+    }
+    case "autoMMMinMatchRatio": {
+      if (typeof value === "number") {
+        config[key] = value;
+        return;
+      }
+      const num = parseFloat(String(value));
+      if (!Number.isNaN(num)) {
+        config[key] = num;
+        return;
+      }
+      config[key] = DEFAULT_CONFIG[key];
+      return `Invalid number for autoMMMinMatchRatio: "${value}". Using default: ${DEFAULT_CONFIG[key]}`;
     }
     case "maxRecallTokens": {
       if (typeof value === "number") {
@@ -1078,6 +1110,11 @@ export function loadConfig(extensionsDir?: string): {
     PI_HINDSIGHT_AUTO_RECALL_TAGS_MATCH: "autoRecallTagsMatch",
     PI_HINDSIGHT_AUTO_RECALL_TAG_GROUPS: "autoRecallTagGroups",
     PI_HINDSIGHT_CONSTANT_TAGS: "constantTags",
+    PI_HINDSIGHT_AUTO_MM_ENABLED: "autoMMEnabled",
+    PI_HINDSIGHT_AUTO_MM_TOP_K: "autoMMTopK",
+    PI_HINDSIGHT_AUTO_MM_MIN_MATCH_COUNT: "autoMMMinMatchCount",
+    PI_HINDSIGHT_AUTO_MM_MIN_MATCH_RATIO: "autoMMMinMatchRatio",
+    PI_HINDSIGHT_AUTO_MM_DISPLAY: "autoMMDisplay",
     PI_HINDSIGHT_FLUSH_ON_COMPACT: "flushOnCompact",
     PI_HINDSIGHT_RETAIN_SESSIONS_BY_DEFAULT: "retainSessionsByDefault",
     PI_HINDSIGHT_RETAIN_CONTENT: "retainContent",
@@ -1185,6 +1222,23 @@ export function validateConfig(config: HindsightConfig): {
       `recallMaxQueryChars must be >= 1. Using default: ${DEFAULT_CONFIG.recallMaxQueryChars}.`
     );
     config.recallMaxQueryChars = DEFAULT_CONFIG.recallMaxQueryChars;
+  }
+
+  if (config.autoMMTopK < 0) {
+    warnings.push(`autoMMTopK must be >= 0. Using default: ${DEFAULT_CONFIG.autoMMTopK}.`);
+    config.autoMMTopK = DEFAULT_CONFIG.autoMMTopK;
+  }
+  if (config.autoMMMinMatchCount < 0) {
+    warnings.push(
+      `autoMMMinMatchCount must be >= 0. Using default: ${DEFAULT_CONFIG.autoMMMinMatchCount}.`
+    );
+    config.autoMMMinMatchCount = DEFAULT_CONFIG.autoMMMinMatchCount;
+  }
+  if (config.autoMMMinMatchRatio < 0 || config.autoMMMinMatchRatio > 1) {
+    warnings.push(
+      `autoMMMinMatchRatio must be between 0 and 1. Using default: ${DEFAULT_CONFIG.autoMMMinMatchRatio}.`
+    );
+    config.autoMMMinMatchRatio = DEFAULT_CONFIG.autoMMMinMatchRatio;
   }
 
   // Valid content types per retainContent role

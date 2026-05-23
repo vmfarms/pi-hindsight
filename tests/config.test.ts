@@ -39,6 +39,11 @@ const validConfig: HindsightConfig = {
   autoRecallTagsMatch: "any",
   autoRecallTagGroups: null,
   constantTags: ["test"],
+  autoMMEnabled: false,
+  autoMMTopK: 2,
+  autoMMMinMatchCount: 10,
+  autoMMMinMatchRatio: 0.2,
+  autoMMDisplay: true,
   retainContent: {
     assistant: ["text"],
     user: ["text"],

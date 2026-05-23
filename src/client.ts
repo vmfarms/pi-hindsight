@@ -214,6 +214,71 @@ export class HindsightClientWrapper {
   }
 
   /**
+   * List all mental models in the bank (metadata only — no content).
+   * Used by autoMM to learn which MMs are registered and their tag filters.
+   */
+  async listMentalModels(
+    signal?: AbortSignal,
+    timeoutMs: number = 10000
+  ): Promise<{
+    success: boolean;
+    items?: Array<{ id: string; name: string; tags: string[] }>;
+    error?: string;
+  }> {
+    try {
+      const result = await this.withTimeout(
+        this.client.listMentalModels(this.config.bankId, { signal }),
+        timeoutMs,
+        signal
+      );
+      const items = (result?.items ?? []).map(
+        (m: { id: string; name: string; tags?: string[] }) => ({
+          id: m.id,
+          name: m.name,
+          tags: m.tags ?? [],
+        })
+      );
+      return { success: true, items };
+    } catch (e) {
+      return { success: false, error: this.formatError(e) };
+    }
+  }
+
+  /**
+   * Fetch a single mental model's full content (the synthesized handbook markdown).
+   * Used by autoMM to inject the matching MMs' content into the prompt context.
+   */
+  async getMentalModel(
+    mentalModelId: string,
+    signal?: AbortSignal,
+    timeoutMs: number = 10000
+  ): Promise<{
+    success: boolean;
+    id?: string;
+    name?: string;
+    content?: string | null;
+    tags?: string[];
+    error?: string;
+  }> {
+    try {
+      const result = await this.withTimeout(
+        this.client.getMentalModel(this.config.bankId, mentalModelId, { signal }),
+        timeoutMs,
+        signal
+      );
+      return {
+        success: true,
+        id: result?.id,
+        name: result?.name,
+        content: result?.content ?? null,
+        tags: result?.tags ?? [],
+      };
+    } catch (e) {
+      return { success: false, error: this.formatError(e) };
+    }
+  }
+
+  /**
    * Reflect and generate a contextual answer using the bank's identity and memories.
    */
   async reflect(

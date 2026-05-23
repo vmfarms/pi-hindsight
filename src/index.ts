@@ -8,6 +8,13 @@
 import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
 import { Box, type Component, Text } from "@earendil-works/pi-tui";
 import type { RecallResponse } from "@vectorize-io/hindsight-client";
+import {
+  type AutoMMEntry,
+  type AutoMMMessage,
+  type AutoMMMessageDetails,
+  injectAutoMM,
+  type MentalModelMeta,
+} from "./auto-mm";
 import { HindsightClientWrapper } from "./client";
 import { registerCommands } from "./commands";
 import {
@@ -35,6 +42,14 @@ let lastRecallMessage: ReturnType<typeof formatRecallMessage> | null = null;
 // (not consumed by the context handler like lastRecallMessage is).
 let lastRecallDetails: RecallMessageDetails | null = null;
 
+// autoMM injection — paralleled with the recall cache. Built in
+// before_agent_start, consumed by the context handler on the same turn.
+let lastAutoMMMessage: AutoMMMessage | null = null;
+
+// Session-scoped cache of the MM list (id/name/tags). Avoids a list round-trip
+// each turn. Invalidated on session_start.
+let mmListCache: MentalModelMeta[] | null = null;
+
 /**
  * Reset module-level mutable state. Exported for testing only.
  */
@@ -42,6 +57,8 @@ export function _resetState(): void {
   autoRecallDisplayOverride = null;
   lastRecallMessage = null;
   lastRecallDetails = null;
+  lastAutoMMMessage = null;
+  mmListCache = null;
 }
 
 /**
@@ -197,6 +214,17 @@ export default function (pi: ExtensionAPI) {
   // call, so toggling display immediately shows/hides existing messages.
   registerRecallRenderer(pi, getRecallDisplay);
 
+  // Register custom message renderer for hindsight-mm (autoMM handbook injections).
+  // Always renders — display:false hides the body, just shows a one-line summary.
+  pi.registerMessageRenderer<AutoMMMessageDetails>(
+    "hindsight-mm",
+    (message, { expanded }, theme) => {
+      const d = message.details;
+      if (!d) return undefined;
+      return new AutoMMMessageComponent(d, theme, expanded, () => config.autoMMDisplay);
+    }
+  );
+
   // Auto-recall on before_agent_start.
   // Always performs recall and caches the result for the context handler to re-inject.
   // Only returns the message (persisting it to session) when autoRecallPersist is true.
@@ -241,6 +269,68 @@ export default function (pi: ExtensionAPI) {
     if (result) {
       lastRecallMessage = result.recallMessage;
       lastRecallDetails = result.recallMessage.details;
+
+      // autoMM injection — runs after recall, scoring against the same results.
+      // Pattern C: select fresh per turn, but dedup against MMs already injected
+      // earlier in the session (read from session entries via getEntries).
+      if (config.autoMMEnabled && client) {
+        try {
+          const entries = ctx.sessionManager.getEntries();
+          const alreadyInjected = collectInjectedMMIds(entries);
+          const mmResult = await injectAutoMM({
+            client,
+            recallResults: result.recallResults,
+            config: {
+              autoMMEnabled: config.autoMMEnabled,
+              autoMMTopK: config.autoMMTopK,
+              autoMMMinMatchCount: config.autoMMMinMatchCount,
+              autoMMMinMatchRatio: config.autoMMMinMatchRatio,
+              autoMMDisplay: config.autoMMDisplay,
+            },
+            signal: ctx.signal,
+            mmListCache: mmListCache ?? undefined,
+            onAudit: (entry) => pi.appendEntry<AutoMMEntry>("hindsight-mm-audit", entry),
+          });
+          if (mmResult.mmList) mmListCache = mmResult.mmList;
+          if (mmResult.message) {
+            // Filter to the candidates not already injected. Without this the
+            // model would see the same handbook twice in conversation history.
+            const newSelected = mmResult.message.details.selected.filter(
+              (s) => !alreadyInjected.has(s.id)
+            );
+            if (newSelected.length === 0) {
+              // All candidates already injected this session — skip.
+              lastAutoMMMessage = null;
+            } else if (newSelected.length === mmResult.message.details.selected.length) {
+              // No filtering needed — inject the full message.
+              lastAutoMMMessage = mmResult.message;
+              pi.sendMessage(
+                {
+                  customType: "hindsight-mm",
+                  content: mmResult.message.content,
+                  display: mmResult.message.display,
+                  details: mmResult.message.details,
+                },
+                { triggerTurn: false }
+              );
+            } else {
+              // Partial filter — drop the already-injected blocks. Rebuild content
+              // from the body field is expensive; the simpler correct behavior is
+              // to drop autoMM injection this turn if the dedup-filtered set is
+              // strictly smaller (means at least one MM was already injected and
+              // we'd duplicate it). This is rare in practice — selections tend
+              // to be all-new or all-already-injected.
+              lastAutoMMMessage = null;
+            }
+          } else {
+            lastAutoMMMessage = null;
+          }
+        } catch (e) {
+          console.warn("pi-hindsight: autoMM error:", e);
+          lastAutoMMMessage = null;
+        }
+      }
+
       // Only persist to session file when autoRecallPersist is true
       if (config.autoRecallPersist) {
         return { message: result.recallMessage };
@@ -251,6 +341,11 @@ export default function (pi: ExtensionAPI) {
   // Context event handler:
   // 1. Always filter out hindsight-recall messages (prevent stale recalls from being sent to LLM)
   // 2. Re-inject cached recall from before_agent_start (so the LLM sees fresh recall)
+  // 3. Re-inject cached autoMM (handbooks) only if not already present in messages.
+  //    Unlike recall, hindsight-mm messages persist in session — sendMessage in
+  //    before_agent_start added the new one, so prior turns' handbooks stay in
+  //    context naturally. We only re-inject from cache when sendMessage's effect
+  //    hasn't propagated to event.messages yet for the current turn.
   pi.on("context", async (event, _ctx: ExtensionContext) => {
     const messages = event.messages as Array<{
       role: string;
@@ -269,9 +364,31 @@ export default function (pi: ExtensionAPI) {
     // when autoRecallPersist: false, it's ephemeral (re-injected here only for this turn).
     const cachedRecall = lastRecallMessage;
     lastRecallMessage = null; // Clear after reading (consume once per turn)
+
+    // autoMM: re-inject from cache only if the current message list doesn't
+    // already contain it (defensive — sendMessage adds it but timing may vary).
+    const cachedAutoMM = lastAutoMMMessage;
+    lastAutoMMMessage = null;
+    const autoMMAlreadyPresent =
+      cachedAutoMM !== null &&
+      messages.some(
+        (m) =>
+          m.customType === "hindsight-mm" &&
+          typeof (m as { content?: unknown }).content === "string" &&
+          (m as { content: string }).content === cachedAutoMM.content
+      );
+
+    const extras: typeof messages = [];
     if (cachedRecall) {
       lastRecallDetails = cachedRecall.details;
-      return { messages: [...filteredMessages, cachedRecall] } as Record<string, unknown>;
+      extras.push(cachedRecall as unknown as (typeof messages)[number]);
+    }
+    if (cachedAutoMM && !autoMMAlreadyPresent) {
+      extras.push(cachedAutoMM as unknown as (typeof messages)[number]);
+    }
+
+    if (extras.length > 0) {
+      return { messages: [...filteredMessages, ...extras] } as Record<string, unknown>;
     }
 
     // If we filtered out recall messages but didn't re-inject, return filtered array
@@ -317,6 +434,8 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_before_switch", async (_event, ctx: ExtensionContext) => {
     lastRecallMessage = null;
     lastRecallDetails = null;
+    lastAutoMMMessage = null;
+    mmListCache = null;
     await flushCurrentSession(ctx, "before session switch");
   });
 
@@ -324,6 +443,8 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_before_fork", async (_event, ctx: ExtensionContext) => {
     lastRecallMessage = null;
     lastRecallDetails = null;
+    lastAutoMMMessage = null;
+    mmListCache = null;
     await flushCurrentSession(ctx, "before session fork");
   });
 
@@ -355,7 +476,10 @@ export default function (pi: ExtensionAPI) {
     sessionId: string,
     sessionCwd: string,
     parentSessionId?: string
-  ): Promise<{ recallMessage: ReturnType<typeof formatRecallMessage> } | null> {
+  ): Promise<{
+    recallMessage: ReturnType<typeof formatRecallMessage>;
+    recallResults: RecallResponse["results"];
+  } | null> {
     // Expand recall tag placeholders with session context
     const placeholderParams = {
       sessionId,
@@ -435,6 +559,79 @@ export default function (pi: ExtensionAPI) {
       );
     }
   }
+}
+
+/**
+ * Renderer for hindsight-mm custom messages. Always shows a one-line summary;
+ * the full handbook body is shown only when the user expands the message AND
+ * autoMMDisplay is enabled.
+ */
+class AutoMMMessageComponent implements Component {
+  constructor(
+    private details: AutoMMMessageDetails,
+    private theme: Theme,
+    private expanded: boolean,
+    private getDisplay: () => boolean
+  ) {}
+
+  invalidate(): void {}
+
+  render(width: number): string[] {
+    const th = this.theme;
+    const summary =
+      th.fg("accent", "📖 Hindsight handbooks ") +
+      th.fg(
+        "muted",
+        this.details.selected
+          .map((s) => `${s.name} (${s.matchCount}x, ${s.contentLength} chars)`)
+          .join(" + ")
+      );
+    const box = new Box(1, 1, (t) => th.bg("customMessageBg", t));
+    box.addChild(new Text(summary, 0, 0));
+    if (this.expanded && this.getDisplay()) {
+      const contentWidth = Math.max(1, width - 2);
+      const separator = th.fg("dim", "─".repeat(contentWidth));
+      box.addChild(new Text(separator, 0, 0));
+      box.addChild(new Text(this.details.body, 0, 0));
+      box.addChild(new Text(separator, 0, 0));
+    }
+    return box.render(width);
+  }
+}
+
+/**
+ * Walk session entries to find prior `hindsight-mm` custom messages and
+ * extract the MM IDs they injected. Used by autoMM dedup to avoid injecting
+ * the same handbook twice in a single session.
+ *
+ * Exported for testing.
+ */
+export function collectInjectedMMIds(entries: ReadonlyArray<unknown>): Set<string> {
+  const ids = new Set<string>();
+  for (const entry of entries) {
+    const e = entry as {
+      type?: string;
+      message?: { role?: string; customType?: string; details?: AutoMMMessageDetails };
+      customType?: string;
+      data?: { selected?: Array<{ id: string }> };
+    };
+    // Message-shaped session entry: custom message with customType "hindsight-mm".
+    const msg = e.message;
+    if (msg && msg.role === "custom" && msg.customType === "hindsight-mm" && msg.details) {
+      for (const s of msg.details.selected ?? []) {
+        if (s.id) ids.add(s.id);
+      }
+      continue;
+    }
+    // Fallback: also consider the top-level (without nesting under .message).
+    if (e.customType === "hindsight-mm" && e.data) {
+      const sel = (e.data as { selected?: Array<{ id: string }> }).selected;
+      for (const s of sel ?? []) {
+        if (s.id) ids.add(s.id);
+      }
+    }
+  }
+  return ids;
 }
 
 /**
@@ -687,7 +884,10 @@ export async function doAutoRecallImpl(
   display: boolean,
   config: AutoRecallConfig,
   cacheDetails: (details: RecallMessageDetails | null) => void
-): Promise<{ recallMessage: ReturnType<typeof formatRecallMessage> } | null> {
+): Promise<{
+  recallMessage: ReturnType<typeof formatRecallMessage>;
+  recallResults: RecallResponse["results"];
+} | null> {
   if (!client) return null;
 
   // Truncate query safely (handles multi-byte Unicode)
@@ -725,7 +925,7 @@ export async function doAutoRecallImpl(
       );
       // Cache recall details for show-recall command
       cacheDetails(recallMessage.details);
-      return { recallMessage };
+      return { recallMessage, recallResults: results };
     }
 
     cacheDetails(null);
