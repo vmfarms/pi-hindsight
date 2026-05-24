@@ -21,7 +21,7 @@
  */
 
 import { existsSync, lstatSync, readdirSync, readlinkSync, statSync } from "node:fs";
-import { basename, join } from "node:path";
+import { basename, isAbsolute, join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { HindsightClientWrapper } from "../client";
 import type { HindsightConfig } from "../config";
@@ -628,6 +628,144 @@ export function createReviewSubcommand(
         }
         // Loop: re-list held sessions to reflect whatever just happened.
       }
+    },
+  };
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Non-interactive verbs for the L2 worker
+// ──────────────────────────────────────────────────────────────────────────────
+//
+// The L1 review UI is the operator surface; the L2 worker drives the same
+// transitions via `pi --once '/hindsight session-ingest <abs-path>'`. Both
+// commands here take a required absolute path to a held-session JSONL and
+// dispatch to the existing off-session helpers in src/gate.ts. No prompts,
+// no confirms — they return after the underlying transition completes so the
+// worker can rely on filesystem state (queue files deleted, symlinks moved)
+// to detect success.
+
+/**
+ * Parse the args for `session-ingest <abs-path>` / `session-reject <abs-path>`.
+ * Returns either a usable target or an operator-facing error message.
+ *
+ * - First positional arg must be an absolute path to a session JSONL.
+ * - `--reason "<text>"` (or `'<text>'`) is optional and only meaningful for
+ *   reject.
+ */
+function parseNonInteractiveArgs(
+  args: string
+): { path: string; reason?: string } | { error: string } {
+  const trimmed = args.trim();
+  if (!trimmed) {
+    return { error: 'Usage: <abs-path-to-session.jsonl> [--reason "..."]' };
+  }
+  // Split off --reason "..." first; the positional path is everything before it.
+  let path = trimmed;
+  let reason: string | undefined;
+  const reasonIdx = trimmed.indexOf("--reason");
+  if (reasonIdx !== -1) {
+    path = trimmed.slice(0, reasonIdx).trim();
+    let after = trimmed.slice(reasonIdx + "--reason".length).trim();
+    if (
+      (after.startsWith('"') && after.endsWith('"')) ||
+      (after.startsWith("'") && after.endsWith("'"))
+    ) {
+      after = after.slice(1, -1);
+    }
+    reason = after || undefined;
+  }
+  if (!path) {
+    return { error: "Missing positional <abs-path-to-session.jsonl>" };
+  }
+  if (!isAbsolute(path)) {
+    return { error: `Path must be absolute: ${path}` };
+  }
+  return { path, reason };
+}
+
+/**
+ * Read the JSONL header to recover the canonical sessionId for a given file.
+ * Returns the id or an error string suitable for `ui.notify`.
+ */
+function readSessionIdFromPath(sessionPath: string): { sessionId: string } | { error: string } {
+  if (!existsSync(sessionPath)) {
+    return { error: `Session file not found: ${sessionPath}` };
+  }
+  try {
+    const { header } = parseSessionFile(sessionPath);
+    if (!header?.id) {
+      return { error: `No session id in header for ${sessionPath}` };
+    }
+    return { sessionId: header.id };
+  } catch (e) {
+    const message = e instanceof Error ? e.message : String(e);
+    return { error: `Failed to parse ${sessionPath}: ${message}` };
+  }
+}
+
+/**
+ * `/hindsight session-ingest <abs-path>` — non-interactive promote.
+ *
+ * Wired for the L2 worker (promote.py spawns pi --once with this command).
+ * Operators should use `/hindsight review` instead; this verb deliberately
+ * has no prompts.
+ */
+export function createSessionIngestSubcommand(
+  pi: ExtensionAPI,
+  client: HindsightClientWrapper | null,
+  config: HindsightConfig
+): Subcommand {
+  return {
+    description:
+      "Non-interactive: promote a held session by absolute JSONL path (for L2 worker / scripting)",
+    handler: async (args: string, ctx: ExtensionContext) => {
+      if (!client) {
+        ctx.ui.notify("Hindsight not configured", "error");
+        return;
+      }
+      const parsed = parseNonInteractiveArgs(args);
+      if ("error" in parsed) {
+        ctx.ui.notify(parsed.error, "error");
+        return;
+      }
+      const resolved = readSessionIdFromPath(parsed.path);
+      if ("error" in resolved) {
+        ctx.ui.notify(resolved.error, "error");
+        return;
+      }
+      const result = await promoteHeldSession(ctx, config, client, resolved.sessionId, parsed.path);
+      ctx.ui.notify(result.message, result.ok ? "info" : "error");
+    },
+  };
+}
+
+/**
+ * `/hindsight session-reject <abs-path> [--reason "..."]` — non-interactive discard.
+ *
+ * Wired for the L2 worker; operators should use `/hindsight review` instead.
+ * Reason defaults to "worker reject" if not provided.
+ */
+export function createSessionRejectSubcommand(
+  _pi: ExtensionAPI,
+  config: HindsightConfig
+): Subcommand {
+  return {
+    description:
+      "Non-interactive: discard a held session by absolute JSONL path (for L2 worker / scripting)",
+    handler: async (args: string, ctx: ExtensionContext) => {
+      const parsed = parseNonInteractiveArgs(args);
+      if ("error" in parsed) {
+        ctx.ui.notify(parsed.error, "error");
+        return;
+      }
+      const resolved = readSessionIdFromPath(parsed.path);
+      if ("error" in resolved) {
+        ctx.ui.notify(resolved.error, "error");
+        return;
+      }
+      const reason = parsed.reason ?? "worker reject";
+      const result = discardHeldSession(config, resolved.sessionId, parsed.path, reason);
+      ctx.ui.notify(result.message, result.ok ? "info" : "error");
     },
   };
 }
