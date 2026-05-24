@@ -24,7 +24,13 @@ import {
   type TagGroupInput,
   validateConfig,
 } from "./config";
-import { getHindsightMeta, shouldSessionBeRetained } from "./meta";
+import { holdSession } from "./gate";
+import {
+  getGateDecision,
+  getHindsightMeta,
+  setGateDecision,
+  shouldSessionBeRetained,
+} from "./meta";
 import { prepareEntry, shouldRetainMessage } from "./prepare";
 import { enqueueAutoMessage } from "./queue";
 import { flushQueues, getQueueCount } from "./retention";
@@ -167,6 +173,30 @@ export default function (pi: ExtensionAPI) {
     const existingMeta = getHindsightMeta(entries);
     if (!existingMeta) {
       pi.appendEntry("hindsight-meta", { retained: config.retainSessionsByDefault });
+    }
+
+    // Initialize the retention gate to "pending". Subsequent flushes
+    // (session_before_switch/_fork/_compact/_shutdown, /hindsight flush) check
+    // the latest gate decision and only proceed when it transitions to
+    // "promoted" — see flushCurrentSession() chokepoint guard below.
+    // Skipped when retentionGate.mode === "off" to preserve pre-L1 flush
+    // semantics for operators who haven't opted into gating yet.
+    if (config.retentionGate.mode !== "off") {
+      const existingGate = getGateDecision(entries);
+      if (!existingGate) {
+        pi.appendEntry(
+          "hindsight-meta",
+          setGateDecision(
+            {
+              status: "pending",
+              decidedAt: new Date().toISOString(),
+              decidedBy: "auto",
+              reason: "session_start initialization",
+            },
+            getHindsightMeta(entries)
+          )
+        );
+      }
     }
 
     // Update hindsight_retain tool visibility based on retention state.
@@ -486,8 +516,17 @@ export default function (pi: ExtensionAPI) {
     }
   });
 
-  // Flush queues on session shutdown
+  // Flush queues on session shutdown.
+  // When the gate is still "pending" and we're in interactive-menu mode,
+  // default-defer the session (RFC §7.2) so it lands in the review queue
+  // for later operator action instead of being silently dropped.
   pi.on("session_shutdown", async (_event, ctx: ExtensionContext) => {
+    if (config.retentionGate.mode === "interactive-menu") {
+      const gate = getGateDecision(ctx.sessionManager.getEntries());
+      if (!gate || gate.status === "pending") {
+        await holdSession(pi, ctx, config, "default-defer on shutdown", "auto");
+      }
+    }
     await flushCurrentSession(ctx, "on shutdown", true);
   });
 
@@ -554,6 +593,20 @@ export default function (pi: ExtensionAPI) {
 
     const sessionId = ctx.sessionManager.getSessionId();
     if (!sessionId) return;
+
+    // Retention-gate chokepoint (RFC §4). All five flush triggers
+    // (session_before_switch, session_before_fork, session_compact,
+    // session_shutdown, /hindsight flush) funnel through here, so a single
+    // guard at the top of this function makes the whole flush pipeline
+    // gate-aware. Skipped entirely when retentionGate.mode === "off" to
+    // preserve backward-compat behavior for operators not yet opted in.
+    if (config.retentionGate.mode !== "off") {
+      const gate = getGateDecision(ctx.sessionManager.getEntries());
+      if (gate?.status !== "promoted") {
+        console.log(`pi-hindsight: ${reason} — skipping flush (gate=${gate?.status ?? "pending"})`);
+        return;
+      }
+    }
 
     const count = getQueueCount(sessionId);
     if (count === 0) return;

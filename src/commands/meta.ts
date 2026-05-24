@@ -6,7 +6,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import type { HindsightClientWrapper } from "../client";
 import type { HindsightConfig } from "../config";
 import { getHindsightMeta, type HindsightMeta, shouldSessionBeRetained } from "../meta";
-import { deleteAutoQueue, deleteToolQueue } from "../queue";
+import { deleteQueuesForSession } from "../queue";
 import { isToolEnabled, updateRetainToolVisibility } from "../tools";
 import type { Subcommand } from "./types";
 import { parseAndUpsertSession } from "./utils";
@@ -67,8 +67,7 @@ export function createToggleRetainSubcommand(
         // (tool retains are only queued when retention is enabled), but clean up
         // defensively in case the state got out of sync.
         if (sessionId) {
-          deleteAutoQueue(sessionId);
-          deleteToolQueue(sessionId);
+          deleteQueuesForSession(sessionId);
         }
 
         // Parse and upsert the full session
@@ -112,8 +111,7 @@ export function createToggleRetainSubcommand(
 
         // Delete queue files so queued messages will NOT be flushed
         if (sessionId) {
-          deleteAutoQueue(sessionId);
-          deleteToolQueue(sessionId);
+          deleteQueuesForSession(sessionId);
         }
 
         ctx.ui.notify("Session retention: disabled (queued messages deleted)", "info");

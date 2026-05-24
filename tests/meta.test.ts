@@ -3,9 +3,16 @@
  */
 
 import { describe, expect, it } from "bun:test";
-import { getHindsightMeta, shouldSessionBeRetained } from "../src/meta";
+import { type GateDecision, getHindsightMeta, shouldSessionBeRetained } from "../src/meta";
 
 type MetaEntry = Parameters<typeof getHindsightMeta>[0][number];
+
+const sampleGate: GateDecision = {
+  status: "held",
+  decidedAt: "2026-05-01T00:00:00Z",
+  decidedBy: "operator",
+  reason: "needs review",
+};
 
 describe("getHindsightMeta", () => {
   it("returns null when no hindsight-meta entries exist", () => {
@@ -48,6 +55,27 @@ describe("getHindsightMeta", () => {
       { type: "custom", customType: "hindsight-meta", data: { tags: ["topic:ai"] } },
     ];
     expect(getHindsightMeta(entries)).toEqual({ tags: ["topic:ai"] });
+  });
+
+  it("returns meta with gate when set alongside retained", () => {
+    const entries: MetaEntry[] = [
+      {
+        type: "custom",
+        customType: "hindsight-meta",
+        data: { retained: true, gate: sampleGate },
+      },
+    ];
+    expect(getHindsightMeta(entries)).toEqual({ retained: true, gate: sampleGate });
+  });
+
+  it("uses the latest entry — later entry without retained shadows the prior retained", () => {
+    // Documents the existing latest-entry semantics. Gate-aware callers should
+    // use getGateDecision (which scans for the field) rather than this helper.
+    const entries: MetaEntry[] = [
+      { type: "custom", customType: "hindsight-meta", data: { retained: true } },
+      { type: "custom", customType: "hindsight-meta", data: { gate: sampleGate } },
+    ];
+    expect(getHindsightMeta(entries)).toEqual({ gate: sampleGate });
   });
 });
 
