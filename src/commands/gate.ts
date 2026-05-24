@@ -21,10 +21,11 @@
  */
 
 import { existsSync, lstatSync, readdirSync, readlinkSync, statSync } from "node:fs";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { HindsightClientWrapper } from "../client";
 import type { HindsightConfig } from "../config";
+import { parseSessionFile } from "../document";
 import {
   discardHeldSession,
   discardSession,
@@ -34,6 +35,7 @@ import {
   promoteSession,
 } from "../gate";
 import { getHindsightMeta } from "../meta";
+import { extractTextFromContent, truncate } from "../utils";
 import type { Subcommand } from "./types";
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -107,12 +109,107 @@ function shortenId(sessionId: string): string {
 }
 
 /**
- * Format a human-readable timestamp ("2026-05-24 10:00") from a Date, with a
- * "?" fallback for entries whose mtime couldn't be resolved.
+ * Compact relative age like "3h" / "2d" / "now" — picker-friendly. Falls back
+ * to a fixed-width "?" so list columns stay aligned.
  */
-function formatTimestamp(when: Date | undefined): string {
-  if (!when) return "?";
-  return when.toISOString().slice(0, 16).replace("T", " ");
+function formatAge(when: Date | undefined, now: Date = new Date()): string {
+  if (!when) return "  ?";
+  const deltaMs = Math.max(0, now.getTime() - when.getTime());
+  const sec = Math.floor(deltaMs / 1000);
+  if (sec < 60) return "now";
+  const min = Math.floor(sec / 60);
+  if (min < 60) return `${min}m`;
+  const hr = Math.floor(min / 60);
+  if (hr < 24) return `${hr}h`;
+  const day = Math.floor(hr / 24);
+  if (day < 30) return `${day}d`;
+  const mo = Math.floor(day / 30);
+  if (mo < 12) return `${mo}mo`;
+  return `${Math.floor(day / 365)}y`;
+}
+
+/**
+ * Right-pad a string to a given visible width. ASCII-only — does not account
+ * for wide characters; the picker labels we build are all ASCII so this is
+ * sufficient. Truncates if too long.
+ */
+function padRight(s: string, width: number): string {
+  if (s.length >= width) return s.slice(0, width);
+  return s + " ".repeat(width - s.length);
+}
+
+/**
+ * At-a-glance info pulled from a session JSONL for the target picker. The
+ * picker label rolls these into a single line so operators can decide
+ * whether to ingest / reject without opening the file.
+ */
+interface SessionSummary {
+  /** Project / cwd basename — e.g. "pi-hindsight" or "tmp-test". */
+  project: string;
+  /** First user message (truncated) or manual session title. */
+  displayName: string;
+  /** Number of message entries in the session. */
+  messageCount: number;
+}
+
+/**
+ * Build a {@link SessionSummary} for a held-session JSONL. Tolerates parse
+ * failures by falling back to placeholder fields — a stale held link should
+ * still show up in the picker so the operator can clean it up.
+ */
+function summarizeHeldSession(sessionPath: string | undefined): SessionSummary {
+  if (!sessionPath || !existsSync(sessionPath)) {
+    return { project: "?", displayName: "(file missing)", messageCount: 0 };
+  }
+  try {
+    const { header, entries } = parseSessionFile(sessionPath);
+    let messageCount = 0;
+    let displayName: string | undefined;
+    for (const entry of entries) {
+      if (entry.type !== "message") continue;
+      messageCount += 1;
+      if (!displayName && entry.message?.role === "user" && entry.message.content !== undefined) {
+        const text = extractTextFromContent(entry.message.content);
+        if (text) displayName = truncate(text, 60);
+      }
+    }
+    return {
+      project: header?.cwd ? basename(header.cwd) : "?",
+      displayName: displayName ?? "(no user message yet)",
+      messageCount,
+    };
+  } catch {
+    return { project: "?", displayName: "(unreadable)", messageCount: 0 };
+  }
+}
+
+/**
+ * Build a {@link SessionSummary} for the running session using the live
+ * sessionManager — avoids the parse cost of {@link summarizeHeldSession} and
+ * sees uncommitted entries.
+ */
+function summarizeCurrentSession(ctx: ExtensionContext): SessionSummary {
+  const entries = ctx.sessionManager.getEntries() as Array<{
+    type: string;
+    message?: { role?: string; content?: unknown };
+  }>;
+  const header = ctx.sessionManager.getHeader();
+  const manualName = ctx.sessionManager.getSessionName?.();
+  let messageCount = 0;
+  let displayName: string | undefined = manualName ?? undefined;
+  for (const entry of entries) {
+    if (entry.type !== "message") continue;
+    messageCount += 1;
+    if (!displayName && entry.message?.role === "user" && entry.message.content !== undefined) {
+      const text = extractTextFromContent(entry.message.content);
+      if (text) displayName = truncate(text, 60);
+    }
+  }
+  return {
+    project: header?.cwd ? basename(header.cwd) : basename(ctx.cwd ?? "?"),
+    displayName: displayName ?? "(no user message yet)",
+    messageCount,
+  };
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -130,29 +227,60 @@ type TargetChoice =
 
 // Sentinel-prefixed option labels — string parsing handles dispatch since
 // ui.select only knows about plain strings.
-const CURRENT_PREFIX = "★ Current session — ";
-const HELD_PREFIX = "  ";
+const CURRENT_MARKER = "★";
 const EXIT_OPTION = "Exit";
 const BACK_OPTION = "← Back";
 
+// Column widths for the target-picker labels. Total fits comfortably in a
+// ~110-char wide select dialog while leaving room for the display name.
+const COL_MARKER = 1; // "★" or " "
+const COL_AGE = 4; // "now ", "3h  ", "2d  "
+const COL_ID = 13; // short id ("abc12345…   ")
+const COL_PROJ = 18; // project basename, truncated
+
 /**
- * Build the target-picker option strings. Exported for tests so we can verify
- * the formatting matches the parser without booting the UI.
+ * Build the target-picker option strings. Each held row is summarized (project
+ * + first user prompt + message count) so the operator can identify the
+ * session at a glance, not just by id.
+ *
+ * Exported for tests so we can verify the formatting matches the parser
+ * without booting the UI.
  */
 export function buildTargetOptions(
+  currentSummary: SessionSummary | undefined,
   currentSessionId: string | undefined,
-  heldRows: HeldSessionRow[]
+  heldSummaries: Array<{ row: HeldSessionRow; summary: SessionSummary }>,
+  now: Date = new Date()
 ): string[] {
   const options: string[] = [];
-  if (currentSessionId) {
-    options.push(`${CURRENT_PREFIX}${shortenId(currentSessionId)}`);
+
+  if (currentSessionId && currentSummary) {
+    options.push(formatRow(CURRENT_MARKER, "now", currentSessionId, currentSummary));
   }
-  for (const row of heldRows) {
-    const ts = formatTimestamp(row.modifiedAt);
-    options.push(`${HELD_PREFIX}${ts}  ${shortenId(row.sessionId)}  (held)`);
+  for (const { row, summary } of heldSummaries) {
+    options.push(formatRow(" ", formatAge(row.modifiedAt, now), row.sessionId, summary));
   }
   options.push(EXIT_OPTION);
   return options;
+}
+
+/**
+ * Format a single picker row: `marker age id project messages displayName`.
+ * Columns are padded to keep things aligned across rows.
+ */
+function formatRow(
+  marker: string,
+  age: string,
+  sessionId: string,
+  summary: SessionSummary
+): string {
+  const m = padRight(marker, COL_MARKER);
+  const a = padRight(age, COL_AGE);
+  const i = padRight(shortenId(sessionId), COL_ID);
+  const proj = padRight(summary.project, COL_PROJ);
+  const msgs = `${String(summary.messageCount).padStart(3, " ")} msg`;
+  // Display name is whatever's left after the fixed columns.
+  return `${m} ${a} ${i} ${proj} ${msgs}  ${summary.displayName}`;
 }
 
 /**
@@ -167,10 +295,10 @@ function parseTargetChoice(
   heldRows: HeldSessionRow[]
 ): TargetChoice {
   if (!choice || choice === EXIT_OPTION) return { kind: "exit" };
-  if (currentSessionId && choice.startsWith(CURRENT_PREFIX)) {
+  if (currentSessionId && choice.startsWith(CURRENT_MARKER)) {
     return { kind: "current", sessionId: currentSessionId };
   }
-  // Held rows: match by short id suffix to be robust against label tweaks.
+  // Held rows: match by short id substring (labels contain the truncated id).
   for (const row of heldRows) {
     if (choice.includes(shortenId(row.sessionId))) {
       return { kind: "held", row };
@@ -471,7 +599,12 @@ export function createReviewSubcommand(
           return;
         }
 
-        const options = buildTargetOptions(currentSessionId, heldRows);
+        const heldSummaries = heldRows.map((row) => ({
+          row,
+          summary: summarizeHeldSession(row.targetPath),
+        }));
+        const currentSummary = currentSessionId ? summarizeCurrentSession(ctx) : undefined;
+        const options = buildTargetOptions(currentSummary, currentSessionId, heldSummaries);
         const heldCount = heldRows.length;
         const heldDescriptor = heldCount === 0 ? "no held sessions" : `${heldCount} held`;
         const targetTitle = `Hindsight review — ${heldDescriptor}`;

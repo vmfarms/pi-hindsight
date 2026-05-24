@@ -13,7 +13,7 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { existsSync, mkdirSync, readlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { listHeldSessions } from "../src/commands/gate";
+import { buildTargetOptions, listHeldSessions } from "../src/commands/gate";
 import {
   discardHeldSession,
   discardSession,
@@ -369,6 +369,46 @@ describe("on-session discard clears the prior review-queue symlink", () => {
     const result = await discardSession(pi, ctx, gateConfig, "operator override");
     expect(result.ok).toBe(true);
     expect(existsSync(heldLink)).toBe(false);
+  });
+});
+
+describe("buildTargetOptions", () => {
+  const now = new Date("2026-05-24T12:00:00Z");
+  const sessionSummary = {
+    project: "pi-hindsight",
+    displayName: "Implementing the gate state machine",
+    messageCount: 12,
+  };
+  const heldRow = {
+    sessionId: "abcdef1234567890",
+    linkPath: "/agent/review-queue/abcdef1234567890.jsonl",
+    targetPath: "/agent/sessions/abcdef1234567890.jsonl",
+    modifiedAt: new Date("2026-05-24T09:00:00Z"), // 3h ago
+  };
+
+  it("renders a row with marker, age, short id, project, msg count, and prompt", () => {
+    const options = buildTargetOptions(
+      sessionSummary,
+      "abcdef1234567890",
+      [{ row: heldRow, summary: sessionSummary }],
+      now
+    );
+    // current + held + Exit
+    expect(options.length).toBe(3);
+    expect(options[0]).toContain("★");
+    expect(options[0]).toContain("now");
+    expect(options[0]).toContain("abcdef123456");
+    expect(options[0]).toContain("pi-hindsight");
+    expect(options[0]).toContain("12 msg");
+    expect(options[0]).toContain("Implementing the gate state machine");
+    expect(options[1]).toContain("3h");
+    expect(options[1]).toContain("abcdef123456");
+    expect(options[2]).toBe("Exit");
+  });
+
+  it("omits the current row when no currentSessionId is set", () => {
+    const options = buildTargetOptions(undefined, undefined, [], now);
+    expect(options).toEqual(["Exit"]);
   });
 });
 
