@@ -1,17 +1,17 @@
 /**
  * Retention-gate subcommands (RFC §9).
  *
- * Multi-action menu over the current session's gate state:
- *   - `session ingest`      → promote (parse + upsert)
- *   - `session reject`      → discard (cleanup queues, symlink for forensics)
- *   - `session flag`        → tag without changing gate state
- *   - `session defer`       → hold for later review (symlink into review-queue/)
- *   - `session signal-bad`  → discard + capture failure-mode hint
- *   - `review`              → list held sessions
+ * Flat multi-action menu over the current session's gate state — pi's
+ * slash-command dispatcher is single-token, so each gate verb is its own
+ * top-level subcommand (hyphenated). The handoff used `session ingest` etc.
+ * as a logical grouping; on the wire those become `session-ingest`, etc.
  *
- * `session ingest [<path>]` and `session reject [<path>] [--reason …]` accept
- * an optional absolute path to a held-session JSONL for off-session decisions,
- * mirroring the `parse-and-upsert-session --path` pattern from iter-8.
+ *   - `session-ingest`      → promote (parse + upsert)
+ *   - `session-reject`      → discard (cleanup queues, symlink for forensics)
+ *   - `session-flag`        → tag without changing gate state
+ *   - `session-defer`       → hold for later review (symlink into review-queue/)
+ *   - `session-signal-bad`  → discard + capture failure-mode hint
+ *   - `review`              → list held sessions
  */
 
 import { existsSync, lstatSync, readdirSync, readlinkSync, statSync } from "node:fs";
@@ -129,7 +129,7 @@ export function createSessionFlagSubcommand(pi: ExtensionAPI): Subcommand {
     handler: async (args: string, ctx: ExtensionContext) => {
       const reason = args.trim();
       if (!reason) {
-        ctx.ui.notify("Usage: /hindsight session flag <reason>", "warning");
+        ctx.ui.notify("Usage: /hindsight session-flag <reason>", "warning");
         return;
       }
       const entries = ctx.sessionManager.getEntries();
@@ -166,69 +166,11 @@ export function createSessionSignalBadSubcommand(
     handler: async (args: string, ctx: ExtensionContext) => {
       const reason = args.trim();
       if (!reason) {
-        ctx.ui.notify("Usage: /hindsight session signal-bad <reason>", "warning");
+        ctx.ui.notify("Usage: /hindsight session-signal-bad <reason>", "warning");
         return;
       }
       const result = await discardSession(pi, ctx, config, reason, [reason]);
       ctx.ui.notify(result.message, result.ok ? "info" : "error");
-    },
-  };
-}
-
-/**
- * Create the `session` umbrella subcommand that dispatches to ingest/reject/
- * defer/flag/signal-bad.
- *
- * Implemented as a single subcommand with manual dispatch so it surfaces in
- * the existing `/hindsight` help block as one entry (RFC §9), and so we can
- * keep its argument completions tight.
- */
-export function createSessionSubcommand(
-  pi: ExtensionAPI,
-  client: HindsightClientWrapper | null,
-  config: HindsightConfig
-): Subcommand {
-  const inner: Record<string, Subcommand> = {
-    ingest: createSessionIngestSubcommand(pi, client, config),
-    reject: createSessionRejectSubcommand(pi, config),
-    defer: createSessionDeferSubcommand(pi, config),
-    flag: createSessionFlagSubcommand(pi),
-    "signal-bad": createSessionSignalBadSubcommand(pi, config),
-  };
-  const innerNames = Object.keys(inner);
-  return {
-    description: `Operator decision on the current session — actions: ${innerNames.join(", ")}`,
-    handler: async (args: string, ctx: ExtensionContext) => {
-      const trimmed = args.trim();
-      const spaceIdx = trimmed.indexOf(" ");
-      const actionName = spaceIdx === -1 ? trimmed : trimmed.slice(0, spaceIdx);
-      const actionArgs = spaceIdx === -1 ? "" : trimmed.slice(spaceIdx + 1);
-      if (!actionName) {
-        ctx.ui.notify(`Usage: /hindsight session <${innerNames.join("|")}> [args]`, "warning");
-        return;
-      }
-      const action = inner[actionName];
-      if (!action) {
-        ctx.ui.notify(
-          `Unknown session action: ${actionName}. Available: ${innerNames.join(", ")}`,
-          "error"
-        );
-        return;
-      }
-      await action.handler(actionArgs, ctx);
-    },
-    getArgumentCompletions: async (argumentPrefix: string) => {
-      const parts = argumentPrefix.split(/\s+/);
-      if (parts.length <= 1) {
-        return innerNames
-          .filter((n) => n.startsWith(parts[0] ?? ""))
-          .map((name) => ({
-            label: name,
-            value: name,
-            description: inner[name]?.description ?? "",
-          }));
-      }
-      return null;
     },
   };
 }
