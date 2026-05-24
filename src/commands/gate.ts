@@ -15,15 +15,18 @@
  */
 
 import { existsSync, lstatSync, readdirSync, readlinkSync, statSync } from "node:fs";
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { HindsightClientWrapper } from "../client";
 import type { HindsightConfig } from "../config";
+import { parseSessionFile } from "../document";
 import {
+  discardHeldSession,
   discardSession,
   getDiscardedDir,
   getReviewQueueDir,
   holdSession,
+  promoteHeldSession,
   promoteSession,
 } from "../gate";
 import { getHindsightMeta } from "../meta";
@@ -52,6 +55,82 @@ function parseReasonArg(args: string): { reason?: string; rest: string } {
 }
 
 /**
+ * Result of {@link resolveHeldTarget} — either a usable target or an
+ * operator-facing error string.
+ */
+export type HeldTargetResolution =
+  | { kind: "current" }
+  | { kind: "target"; sessionId: string; sessionPath: string }
+  | { kind: "error"; error: string };
+
+/**
+ * Interpret the leading positional arg on `session-ingest` / `session-reject`:
+ *
+ *   - empty           → act on current session
+ *   - positive int N  → row N from `/hindsight review` (1-indexed)
+ *   - absolute path   → that JSONL file (off-session)
+ *
+ * Reads the JSONL header to recover the canonical sessionId (the symlink
+ * filename is convention-based; the header is the source of truth).
+ */
+export function resolveHeldTarget(reviewDir: string, positionalArg: string): HeldTargetResolution {
+  const arg = positionalArg.trim();
+  if (!arg) return { kind: "current" };
+
+  // Numeric row argument: look up row N (1-indexed) in the current listing.
+  if (/^\d+$/.test(arg)) {
+    const row = Number.parseInt(arg, 10);
+    if (row < 1) return { kind: "error", error: `Row index must be ≥ 1 (got ${arg})` };
+    const rows = listHeldSessions(reviewDir);
+    if (row > rows.length) {
+      return {
+        kind: "error",
+        error: `Row ${row} out of range — only ${rows.length} held session(s). Run /hindsight review to see the list.`,
+      };
+    }
+    const target = rows[row - 1];
+    if (!target?.targetPath) {
+      return {
+        kind: "error",
+        error: `Row ${row} has no resolvable target (dangling symlink?)`,
+      };
+    }
+    return resolveJsonlPath(target.targetPath);
+  }
+
+  // Absolute path: take as a direct file reference.
+  if (isAbsolute(arg)) {
+    return resolveJsonlPath(arg);
+  }
+
+  return {
+    kind: "error",
+    error: `Unrecognized argument: ${arg}. Pass a row number from /hindsight review, or an absolute path to a session JSONL.`,
+  };
+}
+
+/**
+ * Read the session JSONL header to recover its canonical sessionId, returning
+ * a `target` resolution or an `error` if the file is unusable. Shared between
+ * row-based and path-based forms of {@link resolveHeldTarget}.
+ */
+function resolveJsonlPath(sessionPath: string): HeldTargetResolution {
+  if (!existsSync(sessionPath)) {
+    return { kind: "error", error: `Session file not found: ${sessionPath}` };
+  }
+  try {
+    const { header } = parseSessionFile(sessionPath);
+    if (!header?.id) {
+      return { kind: "error", error: `No session id in header for ${sessionPath}` };
+    }
+    return { kind: "target", sessionId: header.id, sessionPath };
+  } catch (e) {
+    const message = e instanceof Error ? e.message : String(e);
+    return { kind: "error", error: `Failed to parse ${sessionPath}: ${message}` };
+  }
+}
+
+/**
  * Create `session ingest` — promote the current session.
  *
  * Sets gate.status = "promoted" and runs parse-and-upsert via gate helpers.
@@ -63,14 +142,32 @@ export function createSessionIngestSubcommand(
   config: HindsightConfig
 ): Subcommand {
   return {
-    description: "Promote the current session to Hindsight (gate → promoted)",
+    description:
+      "Promote a session to Hindsight (current by default, or by row from /hindsight review, or by --path <abs>)",
     handler: async (args: string, ctx: ExtensionContext) => {
       if (!client) {
         ctx.ui.notify("Hindsight not configured", "error");
         return;
       }
-      const { reason } = parseReasonArg(args);
-      const result = await promoteSession(pi, ctx, config, client, reason);
+      const { reason, rest } = parseReasonArg(args);
+      const target = resolveHeldTarget(getReviewQueueDir(config.retentionGate), rest);
+
+      if (target.kind === "error") {
+        ctx.ui.notify(target.error, "error");
+        return;
+      }
+      if (target.kind === "current") {
+        const result = await promoteSession(pi, ctx, config, client, reason);
+        ctx.ui.notify(result.message, result.ok ? "info" : "error");
+        return;
+      }
+      const result = await promoteHeldSession(
+        ctx,
+        config,
+        client,
+        target.sessionId,
+        target.sessionPath
+      );
       ctx.ui.notify(result.message, result.ok ? "info" : "error");
     },
   };
@@ -87,10 +184,28 @@ export function createSessionRejectSubcommand(
   config: HindsightConfig
 ): Subcommand {
   return {
-    description: "Discard the current session (gate → discarded)",
+    description:
+      "Discard a session (current by default, or by row from /hindsight review, or by --path <abs>)",
     handler: async (args: string, ctx: ExtensionContext) => {
-      const { reason } = parseReasonArg(args);
-      const result = await discardSession(pi, ctx, config, reason ?? "operator reject");
+      const { reason, rest } = parseReasonArg(args);
+      const target = resolveHeldTarget(getReviewQueueDir(config.retentionGate), rest);
+      const reasonOrDefault = reason ?? "operator reject";
+
+      if (target.kind === "error") {
+        ctx.ui.notify(target.error, "error");
+        return;
+      }
+      if (target.kind === "current") {
+        const result = await discardSession(pi, ctx, config, reasonOrDefault);
+        ctx.ui.notify(result.message, result.ok ? "info" : "error");
+        return;
+      }
+      const result = discardHeldSession(
+        config,
+        target.sessionId,
+        target.sessionPath,
+        reasonOrDefault
+      );
       ctx.ui.notify(result.message, result.ok ? "info" : "error");
     },
   };

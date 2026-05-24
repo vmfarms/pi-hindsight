@@ -13,8 +13,9 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { existsSync, mkdirSync, readlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { listHeldSessions } from "../src/commands/gate";
+import { listHeldSessions, resolveHeldTarget } from "../src/commands/gate";
 import {
+  discardHeldSession,
   discardSession,
   getDiscardedDir,
   getReviewQueueDir,
@@ -315,6 +316,112 @@ describe("listHeldSessions", () => {
   it("returns an empty array when the review-queue directory does not exist", () => {
     const missing = join(agentDir, "no-such-dir");
     expect(listHeldSessions(missing)).toEqual([]);
+  });
+});
+
+describe("resolveHeldTarget", () => {
+  let reviewDir: string;
+  let sessionPath: string;
+  let heldSessionId: string;
+  let testIdx = 0;
+
+  beforeEach(() => {
+    testIdx += 1;
+    heldSessionId = `row-test-session-${testIdx}`;
+    reviewDir = join(agentDir, `resolve-test-review-queue-${testIdx}`);
+    mkdirSync(reviewDir, { recursive: true });
+    const sessionsDir = join(agentDir, `resolve-test-sessions-${testIdx}`);
+    mkdirSync(sessionsDir, { recursive: true });
+    sessionPath = join(sessionsDir, `${heldSessionId}.jsonl`);
+    writeFileSync(
+      sessionPath,
+      `${JSON.stringify({ type: "session", id: heldSessionId, timestamp: "2026-05-01T00:00:00Z", cwd: "/tmp/x" })}\n`,
+      "utf8"
+    );
+    require("node:fs").symlinkSync(sessionPath, join(reviewDir, `${heldSessionId}.jsonl`));
+  });
+
+  it("returns 'current' when arg is empty", () => {
+    expect(resolveHeldTarget(reviewDir, "")).toEqual({ kind: "current" });
+  });
+
+  it("resolves a numeric row to its target sessionId + sessionPath", () => {
+    const result = resolveHeldTarget(reviewDir, "1");
+    expect(result).toEqual({ kind: "target", sessionId: heldSessionId, sessionPath });
+  });
+
+  it("resolves an absolute path to its target", () => {
+    const result = resolveHeldTarget(reviewDir, sessionPath);
+    expect(result).toEqual({ kind: "target", sessionId: heldSessionId, sessionPath });
+  });
+
+  it("errors when row is out of range", () => {
+    const result = resolveHeldTarget(reviewDir, "99");
+    expect(result.kind).toBe("error");
+    if (result.kind === "error") expect(result.error).toContain("out of range");
+  });
+
+  it("errors when arg is a non-absolute non-numeric token", () => {
+    const result = resolveHeldTarget(reviewDir, "garbage");
+    expect(result.kind).toBe("error");
+  });
+
+  it("errors when an absolute path doesn't exist", () => {
+    const result = resolveHeldTarget(reviewDir, "/nonexistent/session.jsonl");
+    expect(result.kind).toBe("error");
+  });
+});
+
+describe("discardHeldSession", () => {
+  it("removes the review-queue symlink and places one in discarded/", async () => {
+    const reviewDir = join(agentDir, "extensions", "pi-hindsight", "review-queue");
+    mkdirSync(reviewDir, { recursive: true });
+
+    const sessionsDir = join(agentDir, "held-discard-sessions");
+    mkdirSync(sessionsDir, { recursive: true });
+    const sessionId = "held-discard-001";
+    const sessionPath = join(sessionsDir, `${sessionId}.jsonl`);
+    writeFileSync(sessionPath, `{"type":"session","id":"${sessionId}"}\n`, "utf8");
+
+    const heldLink = join(reviewDir, `${sessionId}.jsonl`);
+    require("node:fs").symlinkSync(sessionPath, heldLink);
+    expect(existsSync(heldLink)).toBe(true);
+
+    const result = discardHeldSession(gateConfig, sessionId, sessionPath, "off-session reject");
+    expect(result.ok).toBe(true);
+    expect(result.linkPath).toBeDefined();
+
+    // Stale review-queue link is gone, discarded/ link points at the source.
+    expect(existsSync(heldLink)).toBe(false);
+    const discardedLink = result.linkPath ?? "";
+    expect(require("node:fs").readlinkSync(discardedLink)).toBe(sessionPath);
+  });
+});
+
+describe("on-session discard clears the prior review-queue symlink", () => {
+  it("removes <sessionId>.jsonl from review-queue when discarding the current session", async () => {
+    const pi = createMockPi();
+    const reviewDir = join(agentDir, "extensions", "pi-hindsight", "review-queue");
+    mkdirSync(reviewDir, { recursive: true });
+
+    const sessionsDir = join(agentDir, "on-session-cleanup");
+    mkdirSync(sessionsDir, { recursive: true });
+    const sessionId = "on-session-cleanup-001";
+    const sessionPath = join(sessionsDir, `${sessionId}.jsonl`);
+    writeFileSync(sessionPath, `{"type":"session","id":"${sessionId}"}\n`, "utf8");
+
+    // Simulate a prior default-defer: place a held symlink for this session id.
+    const heldLink = join(reviewDir, `${sessionId}.jsonl`);
+    require("node:fs").symlinkSync(sessionPath, heldLink);
+    expect(existsSync(heldLink)).toBe(true);
+
+    const ctx = createMockContext({ _sessionId: sessionId });
+    (ctx.sessionManager.getSessionFile as () => string) = () => sessionPath;
+    (ctx.sessionManager.getSessionId as () => string) = () => sessionId;
+
+    const result = await discardSession(pi, ctx, gateConfig, "operator override");
+    expect(result.ok).toBe(true);
+    expect(existsSync(heldLink)).toBe(false);
   });
 });
 

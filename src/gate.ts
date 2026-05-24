@@ -15,12 +15,12 @@
  * status is "promoted"; all other statuses (pending / held / discarded) no-op.
  */
 
-import { existsSync, mkdirSync, symlinkSync, unlinkSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, symlinkSync, unlinkSync } from "node:fs";
 import { dirname, join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import type { HindsightClientWrapper } from "./client";
-import { parseAndUpsertSession } from "./commands/utils";
+import { parseAndUpsertSession, parseSessionFromPath, upsertToHindsight } from "./commands/utils";
 import type { HindsightConfig, RetentionGateConfig } from "./config";
 import { type GateDecision, getGateDecision, getHindsightMeta, setGateDecision } from "./meta";
 import { deleteQueuesForSession } from "./queue";
@@ -177,6 +177,10 @@ export async function discardSession(
     failureModes,
   });
 
+  // If a prior default-defer placed a review-queue symlink for this session,
+  // remove it so the session stops appearing in `/hindsight review` after the
+  // operator decided to discard it instead.
+  clearReviewQueueLink(config, sessionId);
   deleteQueuesForSession(sessionId);
 
   const sessionFile = getSessionFilePath(ctx);
@@ -238,6 +242,9 @@ export async function promoteSession(
     // promoted-and-ingested, clean both so the chokepoint flush — which would
     // otherwise re-flush the tool-queue on shutdown — has nothing to send.
     deleteQueuesForSession(sessionId);
+    // Clear any prior review-queue symlink (e.g. from a default-defer that
+    // the operator is now overriding with an explicit ingest).
+    clearReviewQueueLink(config, sessionId);
     return {
       ok: result.level === "info",
       message: result.message,
@@ -253,6 +260,110 @@ export async function promoteSession(
 }
 
 /**
+ * Remove the review-queue symlink for a sessionId if one exists. Used when a
+ * session transitions out of "held" (promoted or discarded) so it stops
+ * showing up in `/hindsight review`.
+ */
+function clearReviewQueueLink(config: HindsightConfig, sessionId: string): void {
+  const linkPath = join(getReviewQueueDir(config.retentionGate), `${sessionId}.jsonl`);
+  try {
+    // lstatSync rather than existsSync — existsSync follows symlinks, which
+    // would say "false" if the target JSONL is gone even though the dangling
+    // link is still present and needs unlinking.
+    lstatSync(linkPath);
+  } catch {
+    return; // no link present
+  }
+  try {
+    unlinkSync(linkPath);
+  } catch {
+    // best-effort
+  }
+}
+
+/**
+ * Discard a session by its on-disk JSONL — used when operators reject a
+ * previously-held session (from `/hindsight review`) rather than the running
+ * one. Moves the review-queue symlink to discarded/ and clears queue files.
+ *
+ * Does NOT append a gate decision to the JSONL: the session isn't running,
+ * and the symlink's location IS the operational state of record. The JSONL
+ * already has a `gate.status="held"` from the original defer; that stays.
+ */
+export function discardHeldSession(
+  config: HindsightConfig,
+  sessionId: string,
+  sessionPath: string,
+  _reason: string
+): GateTransitionResult {
+  clearReviewQueueLink(config, sessionId);
+  deleteQueuesForSession(sessionId);
+
+  const linkPath = join(getDiscardedDir(config.retentionGate), `${sessionId}.jsonl`);
+  const link = placeSymlink(sessionPath, linkPath);
+  if (!link.ok) {
+    return {
+      ok: false,
+      message: `Held session ${sessionId} unqueued, but discarded/ symlink failed: ${link.error}`,
+      error: link.error,
+    };
+  }
+  return { ok: true, message: `Held session ${sessionId} discarded`, linkPath };
+}
+
+/**
+ * Promote a session by its on-disk JSONL — parse the file and upsert to
+ * Hindsight, then remove the review-queue symlink and clear queue files.
+ *
+ * Mirrors {@link parseSessionFromPath} → {@link upsertToHindsight} (the same
+ * path the `/hindsight parse-and-upsert-session --path` command uses), so
+ * promoting a held session is the same operation as ingesting any other
+ * named-path session.
+ */
+export async function promoteHeldSession(
+  ctx: ExtensionContext,
+  config: HindsightConfig,
+  client: HindsightClientWrapper,
+  sessionId: string,
+  sessionPath: string
+): Promise<GateTransitionResult> {
+  const parsed = parseSessionFromPath(sessionPath, config, {
+    currentSessionId: ctx.sessionManager.getSessionId(),
+  });
+  if ("message" in parsed) {
+    return { ok: false, message: `Parse failed: ${parsed.message}` };
+  }
+  try {
+    await upsertToHindsight(
+      client,
+      {
+        content: JSON.stringify(parsed.parsedSession.messages),
+        documentId: parsed.parsedSession.documentId,
+        context: parsed.parsedSession.context,
+        timestamp: parsed.parsedSession.timestamp,
+        tags: parsed.parsedSession.tags,
+        sessionId: parsed.parsedSession.sessionId,
+        parentSessionId: parsed.parsedSession.parentSessionId,
+        sessionCwd: parsed.parsedSession.cwd,
+      },
+      config,
+      ctx.signal
+    );
+  } catch (e) {
+    const message = e instanceof Error ? e.message : String(e);
+    return { ok: false, message: `Upsert failed: ${message}`, error: message };
+  }
+
+  clearReviewQueueLink(config, sessionId);
+  deleteQueuesForSession(sessionId);
+
+  return {
+    ok: true,
+    message: `Held session ${sessionId} promoted (${parsed.parsedSession.messages.length} messages upserted)`,
+  };
+}
+
+/**
  * Re-export commonly needed read helper for callers wiring up gate-aware UI.
  */
-export { getGateDecision };
+export { clearReviewQueueLink, getGateDecision };
