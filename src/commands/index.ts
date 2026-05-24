@@ -12,14 +12,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import type { HindsightClientWrapper } from "../client";
 import type { HindsightConfig } from "../config";
 import type { RecallMessageDetails } from "../index";
-import {
-  createReviewSubcommand,
-  createSessionDeferSubcommand,
-  createSessionFlagSubcommand,
-  createSessionIngestSubcommand,
-  createSessionRejectSubcommand,
-  createSessionSignalBadSubcommand,
-} from "./gate";
+import { createReviewSubcommand } from "./gate";
 import {
   createRemoveTagSubcommand,
   createTagSubcommand,
@@ -65,12 +58,7 @@ export function registerCommands(
     "parse-session": createParseSessionSubcommand(config),
     "parse-and-upsert-session": createParseAndUpsertSessionSubcommand(client, config),
     "upsert-all-parsed": createUpsertAllParsedSubcommand(client, config),
-    "session-ingest": createSessionIngestSubcommand(pi, client, config),
-    "session-reject": createSessionRejectSubcommand(pi, config),
-    "session-defer": createSessionDeferSubcommand(pi, config),
-    "session-flag": createSessionFlagSubcommand(pi),
-    "session-signal-bad": createSessionSignalBadSubcommand(pi, config),
-    review: createReviewSubcommand(config),
+    review: createReviewSubcommand(pi, client, config),
     "toggle-retain": createToggleRetainSubcommand(pi, client, config),
     tag: createTagSubcommand(pi),
     "remove-tag": createRemoveTagSubcommand(pi),

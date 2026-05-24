@@ -1,29 +1,37 @@
 /**
- * Retention-gate subcommands (RFC §9).
+ * Retention-gate review UI (RFC §9).
  *
- * Flat multi-action menu over the current session's gate state — pi's
- * slash-command dispatcher is single-token, so each gate verb is its own
- * top-level subcommand (hyphenated). The handoff used `session ingest` etc.
- * as a logical grouping; on the wire those become `session-ingest`, etc.
+ * Surfaces a single `/hindsight review` subcommand that drives an interactive
+ * loop over the current session and the held-session queue:
  *
- *   - `session-ingest`      → promote (parse + upsert)
- *   - `session-reject`      → discard (cleanup queues, symlink for forensics)
- *   - `session-flag`        → tag without changing gate state
- *   - `session-defer`       → hold for later review (symlink into review-queue/)
- *   - `session-signal-bad`  → discard + capture failure-mode hint
- *   - `review`              → list held sessions
+ *     /hindsight review
+ *       → target picker (current session + held queue + Exit)
+ *         → action picker (ingest / reject / defer / flag / signal-bad / Back)
+ *           → optional input + confirm
+ *           → execute via {@link ../gate} transition helpers
+ *           → loop back to the target picker (now with the updated queue)
+ *
+ * The picker uses pi-tui's {@link SelectList} so navigation, filtering, and
+ * keybindings (↑↓ / j-k / Enter / Esc) match the rest of pi's TUI surface.
+ * `ui.input` and `ui.confirm` from the dialog API gather reasons and gate
+ * destructive transitions — same primitives as `/hindsight toggle-retain`.
+ *
+ * Note on history: an earlier iteration of L1 exposed `session-ingest`,
+ * `session-reject`, `session-defer`, `session-flag`, `session-signal-bad` as
+ * separate slash commands. They've been folded into this review flow so
+ * operators have a single discoverable entry point.
  */
 
 import { existsSync, lstatSync, readdirSync, readlinkSync, statSync } from "node:fs";
-import { isAbsolute, join } from "node:path";
+import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { getSelectListTheme, type Theme } from "@earendil-works/pi-coding-agent";
+import { type Component, type SelectItem, SelectList } from "@earendil-works/pi-tui";
 import type { HindsightClientWrapper } from "../client";
 import type { HindsightConfig } from "../config";
-import { parseSessionFile } from "../document";
 import {
   discardHeldSession,
   discardSession,
-  getDiscardedDir,
   getReviewQueueDir,
   holdSession,
   promoteHeldSession,
@@ -32,428 +40,27 @@ import {
 import { getHindsightMeta } from "../meta";
 import type { Subcommand } from "./types";
 
-/**
- * Extract a reason from `--reason "<text>"` or `--reason <bareword>` style args.
- * Returns the trimmed reason and the remainder of args (anything before --reason).
- */
-function parseReasonArg(args: string): { reason?: string; rest: string } {
-  const trimmed = args.trim();
-  if (!trimmed) return { rest: "" };
-  const reasonIdx = trimmed.indexOf("--reason");
-  if (reasonIdx === -1) return { rest: trimmed };
-  const before = trimmed.slice(0, reasonIdx).trim();
-  let after = trimmed.slice(reasonIdx + "--reason".length).trim();
-  if (!after) return { rest: before };
-  // Support quoted reasons "..." or '...'
-  if (
-    (after.startsWith('"') && after.endsWith('"')) ||
-    (after.startsWith("'") && after.endsWith("'"))
-  ) {
-    after = after.slice(1, -1);
-  }
-  return { reason: after, rest: before };
-}
+// ──────────────────────────────────────────────────────────────────────────────
+// Held-queue listing
+// ──────────────────────────────────────────────────────────────────────────────
 
 /**
- * Result of {@link resolveHeldTarget} — either a usable target or an
- * operator-facing error string.
- */
-export type HeldTargetResolution =
-  | { kind: "current" }
-  | { kind: "target"; sessionId: string; sessionPath: string }
-  | { kind: "error"; error: string };
-
-/**
- * Interpret the leading positional arg on `session-ingest` / `session-reject`:
- *
- *   - empty           → act on current session
- *   - positive int N  → row N from `/hindsight review` (1-indexed)
- *   - absolute path   → that JSONL file (off-session)
- *
- * Reads the JSONL header to recover the canonical sessionId (the symlink
- * filename is convention-based; the header is the source of truth).
- */
-export function resolveHeldTarget(reviewDir: string, positionalArg: string): HeldTargetResolution {
-  const arg = positionalArg.trim();
-  if (!arg) return { kind: "current" };
-
-  // Numeric row argument: look up row N (1-indexed) in the current listing.
-  if (/^\d+$/.test(arg)) {
-    const row = Number.parseInt(arg, 10);
-    if (row < 1) return { kind: "error", error: `Row index must be ≥ 1 (got ${arg})` };
-    const rows = listHeldSessions(reviewDir);
-    if (row > rows.length) {
-      return {
-        kind: "error",
-        error: `Row ${row} out of range — only ${rows.length} held session(s). Run /hindsight review to see the list.`,
-      };
-    }
-    const target = rows[row - 1];
-    if (!target?.targetPath) {
-      return {
-        kind: "error",
-        error: `Row ${row} has no resolvable target (dangling symlink?)`,
-      };
-    }
-    return resolveJsonlPath(target.targetPath);
-  }
-
-  // Absolute path: take as a direct file reference.
-  if (isAbsolute(arg)) {
-    return resolveJsonlPath(arg);
-  }
-
-  return {
-    kind: "error",
-    error: `Unrecognized argument: ${arg}. Pass a row number from /hindsight review, or an absolute path to a session JSONL.`,
-  };
-}
-
-/**
- * Read the session JSONL header to recover its canonical sessionId, returning
- * a `target` resolution or an `error` if the file is unusable. Shared between
- * row-based and path-based forms of {@link resolveHeldTarget}.
- */
-function resolveJsonlPath(sessionPath: string): HeldTargetResolution {
-  if (!existsSync(sessionPath)) {
-    return { kind: "error", error: `Session file not found: ${sessionPath}` };
-  }
-  try {
-    const { header } = parseSessionFile(sessionPath);
-    if (!header?.id) {
-      return { kind: "error", error: `No session id in header for ${sessionPath}` };
-    }
-    return { kind: "target", sessionId: header.id, sessionPath };
-  } catch (e) {
-    const message = e instanceof Error ? e.message : String(e);
-    return { kind: "error", error: `Failed to parse ${sessionPath}: ${message}` };
-  }
-}
-
-/** Short human label for a held-session row, used in the picker UI. */
-function formatHeldRow(row: HeldSessionRow, index: number): string {
-  const when = row.modifiedAt ? row.modifiedAt.toISOString().slice(0, 16).replace("T", " ") : "?";
-  const shortId = `${row.sessionId.slice(0, 12)}…`;
-  return `${String(index + 1).padStart(2, " ")}. ${when}  ${shortId}`;
-}
-
-const PICKER_LABEL_CURRENT = "Current session";
-const PICKER_LABEL_CANCEL = "Cancel";
-
-/**
- * Interactive target resolver for `session-reject` / `session-ingest`.
- *
- * Priority:
- *   1. Explicit positional arg (`rest`) → resolved as row / path / error
- *   2. Otherwise, list held sessions:
- *      - empty list → operate on current session (matches toggle-retain style)
- *      - non-empty  → open a `ui.select` picker with "Current session" + rows
- *
- * Returns null when the user cancels the picker so callers can short-circuit.
- */
-async function resolveTargetInteractive(
-  ctx: ExtensionContext,
-  config: HindsightConfig,
-  rest: string
-): Promise<HeldTargetResolution | null> {
-  const reviewDir = getReviewQueueDir(config.retentionGate);
-  if (rest) {
-    return resolveHeldTarget(reviewDir, rest);
-  }
-  const rows = listHeldSessions(reviewDir);
-  if (rows.length === 0) {
-    return { kind: "current" };
-  }
-  const labels = [
-    PICKER_LABEL_CURRENT,
-    ...rows.map((r, i) => formatHeldRow(r, i)),
-    PICKER_LABEL_CANCEL,
-  ];
-  const choice = await ctx.ui.select("Which session?", labels);
-  if (!choice || choice === PICKER_LABEL_CANCEL) {
-    return null; // operator cancelled
-  }
-  if (choice === PICKER_LABEL_CURRENT) {
-    return { kind: "current" };
-  }
-  // Picker labels are `"  N. ..."` — parse the leading row number.
-  const m = choice.match(/^\s*(\d+)\./);
-  if (!m) {
-    return { kind: "error", error: `Could not parse row from selection: ${choice}` };
-  }
-  const row = rows[Number.parseInt(m[1] ?? "0", 10) - 1];
-  if (!row?.targetPath) {
-    return { kind: "error", error: "Selected row has no resolvable target" };
-  }
-  return resolveJsonlPath(row.targetPath);
-}
-
-/** Human label for a target — used in confirm dialogs. */
-function describeTarget(target: HeldTargetResolution): string {
-  if (target.kind === "target") return `held session ${target.sessionId}`;
-  return "the current session";
-}
-
-/**
- * Prompt for a reason via ui.input if one wasn't already provided on the
- * command line. Returns the resolved reason (possibly the fallback) or null
- * when the operator cancels the input dialog.
- */
-async function promptForReason(
-  ctx: ExtensionContext,
-  provided: string | undefined,
-  title: string,
-  placeholder: string,
-  fallback: string
-): Promise<string | null> {
-  if (provided) return provided;
-  const input = await ctx.ui.input(title, placeholder);
-  if (input === undefined) return null; // cancelled
-  return input.trim() || fallback;
-}
-
-/**
- * Create `session ingest` — promote the current session.
- *
- * Sets gate.status = "promoted" and runs parse-and-upsert via gate helpers.
- * Operators run this when a session is worth keeping in Hindsight.
- */
-export function createSessionIngestSubcommand(
-  pi: ExtensionAPI,
-  client: HindsightClientWrapper | null,
-  config: HindsightConfig
-): Subcommand {
-  return {
-    description:
-      "Promote a session to Hindsight (interactive picker, or pass a row from /hindsight review, or --path <abs>)",
-    handler: async (args: string, ctx: ExtensionContext) => {
-      if (!client) {
-        ctx.ui.notify("Hindsight not configured", "error");
-        return;
-      }
-      const { reason: providedReason, rest } = parseReasonArg(args);
-      const target = await resolveTargetInteractive(ctx, config, rest);
-      if (target === null) {
-        ctx.ui.notify("Ingest cancelled", "info");
-        return;
-      }
-      if (target.kind === "error") {
-        ctx.ui.notify(target.error, "error");
-        return;
-      }
-      const confirmed = await ctx.ui.confirm(
-        "Promote to Hindsight?",
-        `Will parse and upsert ${describeTarget(target)} to the Hindsight bank. This is an explicit ingest into shared memory — continue?`
-      );
-      if (!confirmed) {
-        ctx.ui.notify("Ingest cancelled", "info");
-        return;
-      }
-      if (target.kind === "current") {
-        const result = await promoteSession(pi, ctx, config, client, providedReason);
-        ctx.ui.notify(result.message, result.ok ? "info" : "error");
-        return;
-      }
-      const result = await promoteHeldSession(
-        ctx,
-        config,
-        client,
-        target.sessionId,
-        target.sessionPath
-      );
-      ctx.ui.notify(result.message, result.ok ? "info" : "error");
-    },
-  };
-}
-
-/**
- * Create `session reject` — discard the current session.
- *
- * Sets gate.status = "discarded", removes queue files, symlinks the source
- * JSONL into discarded/ for forensic review.
- */
-export function createSessionRejectSubcommand(
-  pi: ExtensionAPI,
-  config: HindsightConfig
-): Subcommand {
-  return {
-    description:
-      "Discard a session (interactive picker, or pass a row from /hindsight review, or --path <abs>)",
-    handler: async (args: string, ctx: ExtensionContext) => {
-      const { reason: providedReason, rest } = parseReasonArg(args);
-      const target = await resolveTargetInteractive(ctx, config, rest);
-      if (target === null) {
-        ctx.ui.notify("Discard cancelled", "info");
-        return;
-      }
-      if (target.kind === "error") {
-        ctx.ui.notify(target.error, "error");
-        return;
-      }
-      const reason = await promptForReason(
-        ctx,
-        providedReason,
-        "Discard reason (optional)",
-        "e.g. low quality, off-topic",
-        "operator reject"
-      );
-      if (reason === null) {
-        ctx.ui.notify("Discard cancelled", "info");
-        return;
-      }
-      const confirmed = await ctx.ui.confirm(
-        "Discard session?",
-        `Will mark ${describeTarget(target)} as discarded with reason: "${reason}". Queue files will be deleted and the session moved to discarded/.`
-      );
-      if (!confirmed) {
-        ctx.ui.notify("Discard cancelled", "info");
-        return;
-      }
-      if (target.kind === "current") {
-        const result = await discardSession(pi, ctx, config, reason);
-        ctx.ui.notify(result.message, result.ok ? "info" : "error");
-        return;
-      }
-      const result = discardHeldSession(config, target.sessionId, target.sessionPath, reason);
-      ctx.ui.notify(result.message, result.ok ? "info" : "error");
-    },
-  };
-}
-
-/**
- * Create `session defer` — hold the current session for later review.
- *
- * Sets gate.status = "held" and symlinks the source JSONL into review-queue/.
- * Operators use this when they want a second look later (or want the worker
- * to pick it up in autonomous-defer mode).
- */
-export function createSessionDeferSubcommand(
-  pi: ExtensionAPI,
-  config: HindsightConfig
-): Subcommand {
-  return {
-    description: "Defer the current session for later review (gate → held)",
-    handler: async (args: string, ctx: ExtensionContext) => {
-      let reason = args.trim() || undefined;
-      if (!reason) {
-        const input = await ctx.ui.input(
-          "Defer reason (optional)",
-          "e.g. needs second look, judge it"
-        );
-        if (input === undefined) {
-          ctx.ui.notify("Defer cancelled", "info");
-          return;
-        }
-        reason = input.trim() || undefined;
-      }
-      const result = await holdSession(pi, ctx, config, reason);
-      ctx.ui.notify(result.message, result.ok ? "info" : "error");
-    },
-  };
-}
-
-/**
- * Create `session flag <tag>` — annotate without changing gate state.
- *
- * Appends a flag-prefixed tag to session metadata so operators can mark
- * sessions for follow-up without committing to ingest/discard.
- */
-export function createSessionFlagSubcommand(pi: ExtensionAPI): Subcommand {
-  return {
-    description: "Flag the current session with a reason (no gate transition)",
-    handler: async (args: string, ctx: ExtensionContext) => {
-      let reason = args.trim();
-      if (!reason) {
-        const input = await ctx.ui.input("Flag reason", "e.g. revisit, needs-judge");
-        if (input === undefined) {
-          ctx.ui.notify("Flag cancelled", "info");
-          return;
-        }
-        reason = input.trim();
-        if (!reason) {
-          ctx.ui.notify("Flag reason cannot be empty", "warning");
-          return;
-        }
-      }
-      const entries = ctx.sessionManager.getEntries();
-      const existingMeta = getHindsightMeta(entries);
-      const tag = `flag:${reason}`;
-      const existingTags = existingMeta?.tags ?? [];
-      if (existingTags.includes(tag)) {
-        ctx.ui.notify(`Flag "${reason}" already set`, "warning");
-        return;
-      }
-      const next = {
-        ...(existingMeta?.retained !== undefined ? { retained: existingMeta.retained } : {}),
-        ...(existingMeta?.gate ? { gate: existingMeta.gate } : {}),
-        tags: [...existingTags, tag],
-      };
-      pi.appendEntry("hindsight-meta", next);
-      ctx.ui.notify(`Session flagged: ${reason}`, "info");
-    },
-  };
-}
-
-/**
- * Create `session signal-bad <reason>` — discard with explicit failure-mode capture.
- *
- * Convenience over `session reject` that also captures the reason as a failure
- * mode in the gate decision, surfacing it to downstream worker/judge agents.
- */
-export function createSessionSignalBadSubcommand(
-  pi: ExtensionAPI,
-  config: HindsightConfig
-): Subcommand {
-  return {
-    description: "Discard the current session as a bad-behavior signal (gate → discarded)",
-    handler: async (args: string, ctx: ExtensionContext) => {
-      let reason = args.trim();
-      if (!reason) {
-        const input = await ctx.ui.input(
-          "Failure mode (required)",
-          "e.g. hallucinated-tool, leaked-secret, off-topic"
-        );
-        if (input === undefined) {
-          ctx.ui.notify("Signal cancelled", "info");
-          return;
-        }
-        reason = input.trim();
-        if (!reason) {
-          ctx.ui.notify("A failure-mode reason is required for signal-bad", "warning");
-          return;
-        }
-      }
-      const confirmed = await ctx.ui.confirm(
-        "Signal current session as bad?",
-        `Will discard the current session and tag failure mode: "${reason}". Queue files will be deleted.`
-      );
-      if (!confirmed) {
-        ctx.ui.notify("Signal cancelled", "info");
-        return;
-      }
-      const result = await discardSession(pi, ctx, config, reason, [reason]);
-      ctx.ui.notify(result.message, result.ok ? "info" : "error");
-    },
-  };
-}
-
-/**
- * Listing entry returned by {@link listHeldSessions} — used by both the
- * `review` subcommand UI and unit tests for the review-queue helper.
+ * One row from the review-queue directory. Returned by {@link listHeldSessions}
+ * for both UI rendering and unit tests.
  */
 export interface HeldSessionRow {
   sessionId: string;
   linkPath: string;
-  /** Resolved target of the symlink (the actual session JSONL on disk). */
+  /** Symlink target resolved to an absolute path; undefined when unresolvable. */
   targetPath: string | undefined;
-  /** mtime of the target JSONL if accessible; falls back to the symlink mtime. */
+  /** mtime of the resolved target (or symlink if target is gone). */
   modifiedAt: Date | undefined;
 }
 
 /**
  * Enumerate held sessions by reading symlinks from the review-queue directory.
- * Returns sorted-newest-first; entries with unreadable targets still appear so
- * operators can clean up stale symlinks.
+ * Returned newest-first; entries with unreadable targets still appear so
+ * operators can clean up stale links.
  */
 export function listHeldSessions(reviewDir: string): HeldSessionRow[] {
   if (!existsSync(reviewDir)) return [];
@@ -468,19 +75,16 @@ export function listHeldSessions(reviewDir: string): HeldSessionRow[] {
       if (lst.isSymbolicLink()) {
         targetPath = readlinkSync(linkPath);
       } else {
-        // Plain file (not a symlink) — still surface it.
         targetPath = linkPath;
       }
     } catch {
-      // ignore — entry has no readable metadata
+      // ignore
     }
     let modifiedAt: Date | undefined;
     if (targetPath) {
       try {
-        const stat = statSync(targetPath);
-        modifiedAt = stat.mtime;
+        modifiedAt = statSync(targetPath).mtime;
       } catch {
-        // target gone — fall back to symlink mtime
         try {
           modifiedAt = lstatSync(linkPath).mtime;
         } catch {
@@ -499,34 +103,464 @@ export function listHeldSessions(reviewDir: string): HeldSessionRow[] {
 }
 
 /**
- * Create the `review` subcommand — list held sessions.
- *
- * Output is human-readable for interactive use: row number, modified-at,
- * sessionId, and target path. The L4 worker uses the same review-queue
- * directory but enumerates from JSONL targets directly.
+ * Short id used in picker labels — first 12 chars of the sessionId plus an
+ * ellipsis indicator. Full id is shown in description / confirm dialogs.
  */
-export function createReviewSubcommand(config: HindsightConfig): Subcommand {
-  return {
-    description: "List held sessions awaiting review",
-    handler: async (_args: string, ctx: ExtensionContext) => {
-      const reviewDir = getReviewQueueDir(config.retentionGate);
-      const rows = listHeldSessions(reviewDir);
-      if (rows.length === 0) {
-        ctx.ui.notify(`Review queue empty (${reviewDir})`, "info");
-        return;
-      }
-      const lines = rows.map((row, i) => {
-        const idx = String(i + 1).padStart(2, " ");
-        const when = row.modifiedAt ? row.modifiedAt.toISOString() : "?";
-        const target = row.targetPath ?? "(unresolved)";
-        return `${idx}. ${when}  ${row.sessionId}  → ${target}`;
-      });
-      ctx.ui.notify(`Held sessions (${rows.length}):\n${lines.join("\n")}`, "info");
-    },
-  };
+function shortenId(sessionId: string): string {
+  return sessionId.length > 12 ? `${sessionId.slice(0, 12)}…` : sessionId;
 }
 
 /**
- * Export reference to discarded-dir helper for tests / future commands.
+ * Format a human-readable timestamp ("2026-05-24 10:00") from a Date, with a
+ * "?" fallback for entries whose mtime couldn't be resolved.
  */
-export { getDiscardedDir };
+function formatTimestamp(when: Date | undefined): string {
+  if (!when) return "?";
+  return when.toISOString().slice(0, 16).replace("T", " ");
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Overlay component — titled SelectList
+// ──────────────────────────────────────────────────────────────────────────────
+
+const OVERLAY_OPTIONS = { anchor: "center" as const, width: 90, maxHeight: 24 };
+const MAX_VISIBLE = 12;
+
+/**
+ * A SelectList wrapped with a title line and a footer hint. Used for both the
+ * target picker and the action picker so they have a consistent visual frame.
+ */
+class TitledSelector implements Component {
+  constructor(
+    private title: string,
+    private list: SelectList,
+    private theme: Theme,
+    private footer: string
+  ) {}
+
+  invalidate(): void {
+    this.list.invalidate();
+  }
+
+  handleInput(data: string): void {
+    this.list.handleInput(data);
+  }
+
+  render(width: number): string[] {
+    const inner = Math.max(20, width);
+    const titleLine = this.theme.fg("accent", this.title);
+    const footerLine = this.theme.fg("dim", this.footer);
+    const listLines = this.list.render(inner);
+    return [titleLine, "", ...listLines, "", footerLine];
+  }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Target picker (screen 1)
+// ──────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Result returned by the target picker. `held` carries the row chosen from the
+ * review queue; `current` selects the running session; `exit` closes the loop.
+ */
+type TargetChoice =
+  | { kind: "current"; sessionId: string }
+  | { kind: "held"; row: HeldSessionRow }
+  | { kind: "exit" };
+
+const VALUE_CURRENT = "__current__";
+const VALUE_EXIT = "__exit__";
+const VALUE_BACK = "__back__";
+
+/**
+ * Open the target picker overlay. Lists the current session + every held row
+ * (newest first) + an explicit Exit row. Returns the operator's choice.
+ *
+ * If `currentSessionId` is undefined (e.g. session manager isn't ready) the
+ * "current session" entry is omitted — held-only flow still works.
+ */
+async function pickTarget(
+  ctx: ExtensionContext,
+  config: HindsightConfig,
+  currentSessionId: string | undefined,
+  heldRows: HeldSessionRow[]
+): Promise<TargetChoice> {
+  const items: SelectItem[] = [];
+  if (currentSessionId) {
+    items.push({
+      value: VALUE_CURRENT,
+      label: `★ Current session  ${shortenId(currentSessionId)}`,
+      description: "active",
+    });
+  }
+  for (const row of heldRows) {
+    items.push({
+      value: row.sessionId,
+      label: `  ${shortenId(row.sessionId)}`,
+      description: `held since ${formatTimestamp(row.modifiedAt)}`,
+    });
+  }
+  items.push({ value: VALUE_EXIT, label: "Exit", description: "close /hindsight review" });
+
+  const reviewDir = getReviewQueueDir(config.retentionGate);
+  const titleSuffix = heldRows.length === 0 ? "no held sessions" : `${heldRows.length} held`;
+  const title = `Hindsight review — ${titleSuffix} (${reviewDir})`;
+
+  const choiceValue = await ctx.ui.custom<string | null>(
+    (_tui, theme, _kb, done) => {
+      const list = new SelectList(items, MAX_VISIBLE, getSelectListTheme());
+      list.onSelect = (item) => done(item.value);
+      list.onCancel = () => done(null);
+      return new TitledSelector(title, list, theme, "↑↓ navigate · Enter select · Esc exit");
+    },
+    { overlay: true, overlayOptions: OVERLAY_OPTIONS }
+  );
+
+  if (choiceValue === null || choiceValue === VALUE_EXIT) return { kind: "exit" };
+  if (choiceValue === VALUE_CURRENT) {
+    return { kind: "current", sessionId: currentSessionId ?? "" };
+  }
+  const row = heldRows.find((r) => r.sessionId === choiceValue);
+  if (!row) return { kind: "exit" };
+  return { kind: "held", row };
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Action picker (screen 2)
+// ──────────────────────────────────────────────────────────────────────────────
+
+type Action = "ingest" | "reject" | "defer" | "flag" | "signal-bad";
+
+interface ActionEntry {
+  value: Action;
+  label: string;
+  description: string;
+}
+
+/**
+ * Action menu — different sets for current vs held targets. Held sessions
+ * can't be deferred (already deferred) or flagged (the JSONL isn't live, so
+ * an appendEntry tag wouldn't be coherent).
+ */
+function actionsForTarget(target: TargetChoice): ActionEntry[] {
+  if (target.kind === "held") {
+    return [
+      { value: "ingest", label: "Ingest", description: "promote to Hindsight bank" },
+      { value: "reject", label: "Reject", description: "discard (move to discarded/)" },
+      {
+        value: "signal-bad",
+        label: "Signal as bad",
+        description: "discard with explicit failure-mode capture",
+      },
+    ];
+  }
+  return [
+    { value: "ingest", label: "Ingest", description: "promote to Hindsight bank" },
+    { value: "reject", label: "Reject", description: "discard the current session" },
+    { value: "defer", label: "Defer", description: "hold for later review" },
+    { value: "flag", label: "Flag", description: "annotate without changing gate state" },
+    {
+      value: "signal-bad",
+      label: "Signal as bad",
+      description: "discard with explicit failure-mode capture",
+    },
+  ];
+}
+
+/**
+ * Open the action picker overlay for a chosen target. Returns the action, or
+ * null when the operator cancels (Esc) — caller loops back to the target picker.
+ */
+async function pickAction(ctx: ExtensionContext, target: TargetChoice): Promise<Action | null> {
+  const entries = actionsForTarget(target);
+  const items: SelectItem[] = [
+    ...entries.map<SelectItem>((e) => ({
+      value: e.value,
+      label: e.label,
+      description: e.description,
+    })),
+    { value: VALUE_BACK, label: "Back", description: "choose a different session" },
+  ];
+  const targetLabel =
+    target.kind === "current"
+      ? "current session"
+      : `held session ${shortenId(target.row.sessionId)}`;
+  const title = `Action for ${targetLabel}`;
+
+  const choiceValue = await ctx.ui.custom<string | null>(
+    (_tui, theme, _kb, done) => {
+      const list = new SelectList(items, MAX_VISIBLE, getSelectListTheme());
+      list.onSelect = (item) => done(item.value);
+      list.onCancel = () => done(null);
+      return new TitledSelector(title, list, theme, "↑↓ navigate · Enter select · Esc back");
+    },
+    { overlay: true, overlayOptions: OVERLAY_OPTIONS }
+  );
+
+  if (choiceValue === null || choiceValue === VALUE_BACK) return null;
+  return choiceValue as Action;
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Action execution
+// ──────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Result of an action — `cancelled` means the operator dismissed a prompt
+ * mid-flow (return to picker without running the transition).
+ */
+interface ActionResult {
+  status: "ok" | "error" | "cancelled";
+  message: string;
+}
+
+/**
+ * Confirm-dialog wrapper. Returns false if the operator cancels — callers
+ * surface a `cancelled` status so the review loop loops back without notifying
+ * an error.
+ */
+async function confirmAction(ctx: ExtensionContext, title: string, body: string): Promise<boolean> {
+  return await ctx.ui.confirm(title, body);
+}
+
+/**
+ * Prompt for an optional reason. Returns the trimmed reason (or undefined if
+ * blank) — or null when the operator cancels the input dialog.
+ */
+async function promptReason(
+  ctx: ExtensionContext,
+  title: string,
+  placeholder: string
+): Promise<string | undefined | null> {
+  const input = await ctx.ui.input(title, placeholder);
+  if (input === undefined) return null;
+  const trimmed = input.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
+}
+
+/**
+ * Look up the canonical sessionId from a held-session symlink target — used
+ * by ingest/reject paths that take a sessionPath. The symlink filename is
+ * already the sessionId by our convention, so we can return the row's id;
+ * this helper exists to keep callers honest about which id they're using.
+ */
+function targetSessionPath(row: HeldSessionRow): string | undefined {
+  return row.targetPath;
+}
+
+async function executeIngest(
+  ctx: ExtensionContext,
+  config: HindsightConfig,
+  client: HindsightClientWrapper | null,
+  pi: ExtensionAPI,
+  target: TargetChoice
+): Promise<ActionResult> {
+  if (!client) return { status: "error", message: "Hindsight not configured" };
+  const subject =
+    target.kind === "current" ? "the current session" : `held session ${target.row.sessionId}`;
+  const confirmed = await confirmAction(
+    ctx,
+    "Promote to Hindsight bank?",
+    `Will parse and upsert ${subject} into the shared Hindsight bank. Continue?`
+  );
+  if (!confirmed) return { status: "cancelled", message: "Ingest cancelled" };
+
+  if (target.kind === "current") {
+    const result = await promoteSession(pi, ctx, config, client);
+    return { status: result.ok ? "ok" : "error", message: result.message };
+  }
+  const path = targetSessionPath(target.row);
+  if (!path)
+    return {
+      status: "error",
+      message: `Held session ${target.row.sessionId} has no resolvable path`,
+    };
+  const result = await promoteHeldSession(ctx, config, client, target.row.sessionId, path);
+  return { status: result.ok ? "ok" : "error", message: result.message };
+}
+
+async function executeReject(
+  ctx: ExtensionContext,
+  config: HindsightConfig,
+  pi: ExtensionAPI,
+  target: TargetChoice
+): Promise<ActionResult> {
+  const reason = await promptReason(
+    ctx,
+    "Discard reason (optional)",
+    "e.g. low quality, off-topic"
+  );
+  if (reason === null) return { status: "cancelled", message: "Discard cancelled" };
+  const reasonText = reason ?? "operator reject";
+  const subject =
+    target.kind === "current" ? "the current session" : `held session ${target.row.sessionId}`;
+  const confirmed = await confirmAction(
+    ctx,
+    "Discard session?",
+    `Will mark ${subject} as discarded ("${reasonText}"). Queue files will be deleted and the JSONL moved to discarded/.`
+  );
+  if (!confirmed) return { status: "cancelled", message: "Discard cancelled" };
+
+  if (target.kind === "current") {
+    const result = await discardSession(pi, ctx, config, reasonText);
+    return { status: result.ok ? "ok" : "error", message: result.message };
+  }
+  const path = targetSessionPath(target.row);
+  if (!path)
+    return {
+      status: "error",
+      message: `Held session ${target.row.sessionId} has no resolvable path`,
+    };
+  const result = discardHeldSession(config, target.row.sessionId, path, reasonText);
+  return { status: result.ok ? "ok" : "error", message: result.message };
+}
+
+async function executeDefer(
+  ctx: ExtensionContext,
+  config: HindsightConfig,
+  pi: ExtensionAPI,
+  target: TargetChoice
+): Promise<ActionResult> {
+  if (target.kind !== "current") {
+    return { status: "error", message: "Defer is only available for the current session" };
+  }
+  const reason = await promptReason(ctx, "Defer reason (optional)", "e.g. needs second look");
+  if (reason === null) return { status: "cancelled", message: "Defer cancelled" };
+  const result = await holdSession(pi, ctx, config, reason);
+  return { status: result.ok ? "ok" : "error", message: result.message };
+}
+
+async function executeFlag(
+  ctx: ExtensionContext,
+  pi: ExtensionAPI,
+  target: TargetChoice
+): Promise<ActionResult> {
+  if (target.kind !== "current") {
+    return { status: "error", message: "Flag is only available for the current session" };
+  }
+  const reason = await promptReason(ctx, "Flag reason", "e.g. revisit, needs-judge");
+  if (reason === null) return { status: "cancelled", message: "Flag cancelled" };
+  if (!reason) return { status: "error", message: "Flag reason cannot be empty" };
+  const entries = ctx.sessionManager.getEntries();
+  const existingMeta = getHindsightMeta(entries);
+  const tag = `flag:${reason}`;
+  const existingTags = existingMeta?.tags ?? [];
+  if (existingTags.includes(tag)) {
+    return { status: "error", message: `Flag "${reason}" already set` };
+  }
+  const next = {
+    ...(existingMeta?.retained !== undefined ? { retained: existingMeta.retained } : {}),
+    ...(existingMeta?.gate ? { gate: existingMeta.gate } : {}),
+    tags: [...existingTags, tag],
+  };
+  pi.appendEntry("hindsight-meta", next);
+  return { status: "ok", message: `Session flagged: ${reason}` };
+}
+
+async function executeSignalBad(
+  ctx: ExtensionContext,
+  config: HindsightConfig,
+  pi: ExtensionAPI,
+  target: TargetChoice
+): Promise<ActionResult> {
+  const reason = await promptReason(
+    ctx,
+    "Failure mode (required)",
+    "e.g. hallucinated-tool, off-topic"
+  );
+  if (reason === null) return { status: "cancelled", message: "Signal cancelled" };
+  if (!reason)
+    return { status: "error", message: "A failure-mode reason is required for signal-bad" };
+  const subject =
+    target.kind === "current" ? "the current session" : `held session ${target.row.sessionId}`;
+  const confirmed = await confirmAction(
+    ctx,
+    "Signal as bad?",
+    `Will discard ${subject} and tag failure mode: "${reason}". Queue files will be deleted.`
+  );
+  if (!confirmed) return { status: "cancelled", message: "Signal cancelled" };
+
+  if (target.kind === "current") {
+    const result = await discardSession(pi, ctx, config, reason, [reason]);
+    return { status: result.ok ? "ok" : "error", message: result.message };
+  }
+  const path = targetSessionPath(target.row);
+  if (!path)
+    return {
+      status: "error",
+      message: `Held session ${target.row.sessionId} has no resolvable path`,
+    };
+  const result = discardHeldSession(config, target.row.sessionId, path, reason);
+  return { status: result.ok ? "ok" : "error", message: result.message };
+}
+
+async function executeAction(
+  action: Action,
+  target: TargetChoice,
+  ctx: ExtensionContext,
+  config: HindsightConfig,
+  client: HindsightClientWrapper | null,
+  pi: ExtensionAPI
+): Promise<ActionResult> {
+  switch (action) {
+    case "ingest":
+      return executeIngest(ctx, config, client, pi, target);
+    case "reject":
+      return executeReject(ctx, config, pi, target);
+    case "defer":
+      return executeDefer(ctx, config, pi, target);
+    case "flag":
+      return executeFlag(ctx, pi, target);
+    case "signal-bad":
+      return executeSignalBad(ctx, config, pi, target);
+  }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Review subcommand — the single operator entry point
+// ──────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Create the `/hindsight review` subcommand.
+ *
+ * Runs an interactive loop: pick a target session, pick an action, gather any
+ * reason input, confirm if destructive, execute via the gate transition
+ * helpers, then re-list the queue and prompt again. Exiting from the target
+ * picker (Esc or "Exit" row) closes the loop.
+ */
+export function createReviewSubcommand(
+  pi: ExtensionAPI,
+  client: HindsightClientWrapper | null,
+  config: HindsightConfig
+): Subcommand {
+  return {
+    description:
+      "Review held sessions and the current session, then ingest / reject / defer / flag",
+    handler: async (_args: string, ctx: ExtensionContext) => {
+      // Loop until the operator exits.
+      while (true) {
+        const reviewDir = getReviewQueueDir(config.retentionGate);
+        const heldRows = listHeldSessions(reviewDir);
+        const currentSessionId = ctx.sessionManager.getSessionId();
+
+        if (!currentSessionId && heldRows.length === 0) {
+          ctx.ui.notify("Nothing to review — no current session and review queue is empty", "info");
+          return;
+        }
+
+        const target = await pickTarget(ctx, config, currentSessionId, heldRows);
+        if (target.kind === "exit") return;
+
+        const action = await pickAction(ctx, target);
+        if (action === null) continue; // back to target picker
+
+        const result = await executeAction(action, target, ctx, config, client, pi);
+        if (result.status !== "cancelled") {
+          ctx.ui.notify(result.message, result.status === "ok" ? "info" : "error");
+        }
+        // Loop back. The next iteration re-lists held sessions so the queue
+        // reflects whatever just happened.
+      }
+    },
+  };
+}
