@@ -3,7 +3,7 @@
  */
 
 import { existsSync, readdirSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import type { HindsightClientWrapper } from "../client";
@@ -106,21 +106,53 @@ export function createParseSessionSubcommand(config: HindsightConfig): Subcomman
  *
  * Delegates to {@link parseAndUpsertSession} which handles parsing, queue clearing,
  * and retention in one step.
+ *
+ * Optional argument: `--path <absolute-path>` ingests the named on-disk session JSONL
+ * instead of the running session. Path must be absolute; ingesting the currently-running
+ * session is refused (concurrent-write risk).
  */
 export function createParseAndUpsertSessionSubcommand(
   client: HindsightClientWrapper | null,
   config: HindsightConfig
 ): Subcommand {
   return {
-    description: "Parse and upsert the full current session to Hindsight",
-    handler: async (_args: string, ctx: ExtensionContext) => {
+    description:
+      "Parse and upsert the full current session to Hindsight (use --path <abs-path> to ingest a specific JSONL)",
+    handler: async (args: string, ctx: ExtensionContext) => {
       if (!client) {
         ctx.ui.notify("Hindsight not configured", "error");
         return;
       }
 
+      let sessionPath: string | undefined;
+      const trimmed = args.trim();
+      if (trimmed) {
+        if (!trimmed.startsWith("--path")) {
+          ctx.ui.notify(
+            `Unknown argument: ${trimmed}. Usage: parse-and-upsert-session [--path <abs-path>]`,
+            "error"
+          );
+          return;
+        }
+        const rest = trimmed.slice("--path".length).trim();
+        if (!rest) {
+          ctx.ui.notify("--path requires a value (absolute path to a session JSONL)", "error");
+          return;
+        }
+        if (!isAbsolute(rest)) {
+          ctx.ui.notify(`--path must be absolute: ${rest}`, "error");
+          return;
+        }
+        sessionPath = rest;
+      }
+
       try {
-        const result = await parseAndUpsertSession(ctx, config, client);
+        const result = await parseAndUpsertSession(
+          ctx,
+          config,
+          client,
+          sessionPath ? { sessionPath } : {}
+        );
         ctx.ui.notify(result.message, result.level);
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e);

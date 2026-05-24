@@ -503,6 +503,141 @@ describe("registerCommands", () => {
     });
   });
 
+  describe("parse-and-upsert-session --path arg", () => {
+    it("ingests a session at an absolute path", async () => {
+      await withTempDir(async (tmpDir) => {
+        const sessionPath = writeSessionFile(tmpDir, "external-session-abc");
+
+        let retainCalled = false;
+        let retainedDocumentId: string | undefined;
+        mockClient = createMockClient();
+        (mockClient!.retain as ReturnType<typeof mock>).mockImplementation(
+          async (args: { documentId: string }) => {
+            retainCalled = true;
+            retainedDocumentId = args.documentId;
+            return { success: true };
+          }
+        );
+
+        register();
+
+        // Current session is a different ID, so --path ingest is allowed
+        const ctx = makeCtx("current-running-session-xyz");
+        await getHandler()(`parse-and-upsert-session --path ${sessionPath}`, ctx);
+
+        expect(retainCalled).toBe(true);
+        expect(retainedDocumentId).toBeDefined();
+        expect(lastNotification?.message).toContain("Parsed and upserted");
+        expect(lastNotification?.type).toBe("info");
+      });
+    });
+
+    it("rejects relative paths", async () => {
+      register();
+      await getHandler()("parse-and-upsert-session --path relative/path.jsonl", makeCtx());
+      expect(lastNotification?.message).toContain("--path must be absolute");
+      expect(lastNotification?.type).toBe("error");
+    });
+
+    it("rejects empty --path value", async () => {
+      register();
+      await getHandler()("parse-and-upsert-session --path", makeCtx());
+      expect(lastNotification?.message).toContain("--path requires a value");
+      expect(lastNotification?.type).toBe("error");
+    });
+
+    it("rejects unknown arguments", async () => {
+      register();
+      await getHandler()("parse-and-upsert-session --bogus foo", makeCtx());
+      expect(lastNotification?.message).toContain("Unknown argument");
+      expect(lastNotification?.type).toBe("error");
+    });
+
+    it("errors when --path target does not exist", async () => {
+      register();
+      await getHandler()(
+        "parse-and-upsert-session --path /nonexistent/path/to/session.jsonl",
+        makeCtx()
+      );
+      expect(lastNotification?.message).toContain("Session file not found");
+      expect(lastNotification?.type).toBe("error");
+    });
+
+    it("refuses to ingest the currently-running session by ID", async () => {
+      await withTempDir(async (tmpDir) => {
+        const currentId = "live-session-running";
+        const sessionPath = writeSessionFile(tmpDir, currentId);
+
+        register();
+        const ctx = makeCtx(currentId);
+        await getHandler()(`parse-and-upsert-session --path ${sessionPath}`, ctx);
+
+        expect(lastNotification?.message).toContain(
+          "Refusing to ingest the currently-running session"
+        );
+        expect(lastNotification?.type).toBe("error");
+      });
+    });
+
+    it("errors when first line is not a session header", async () => {
+      await withTempDir(async (tmpDir) => {
+        const badPath = join(tmpDir, "not-a-session.jsonl");
+        writeFileSync(
+          badPath,
+          `${JSON.stringify({ type: "message", message: { role: "user", content: "hi" } })}\n`,
+          "utf8"
+        );
+
+        register();
+        await getHandler()(`parse-and-upsert-session --path ${badPath}`, makeCtx());
+
+        expect(lastNotification?.message).toContain("Not a session JSONL");
+        expect(lastNotification?.type).toBe("error");
+      });
+    });
+
+    it("preserves the current session's auto-queue when ingesting an external session", async () => {
+      const currentId = "current-session-with-queue";
+      const externalId = "external-session-being-ingested";
+      const { enqueueAutoMessage, readAutoQueue, deleteAutoQueue, deleteToolQueue } = await import(
+        "../src/queue"
+      );
+
+      await withTempDir(async (tmpDir) => {
+        const externalPath = writeSessionFile(tmpDir, externalId);
+
+        try {
+          enqueueAutoMessage(currentId, {
+            entry: { message: { role: "user", content: "queued-in-current" } },
+            store_method: "auto",
+          });
+          expect(readAutoQueue(currentId)).toHaveLength(1);
+
+          mockClient = createMockClient();
+          (mockClient!.retain as ReturnType<typeof mock>).mockImplementation(async () => ({
+            success: true,
+          }));
+
+          register();
+
+          const ctx = makeCtx(currentId);
+          await getHandler()(`parse-and-upsert-session --path ${externalPath}`, ctx);
+
+          expect(lastNotification?.message).toContain("Parsed and upserted");
+          // External ingest must NOT touch the current session's queue
+          expect(readAutoQueue(currentId)).toHaveLength(1);
+          // External session has no queue either, but explicitly check
+          expect(readAutoQueue(externalId)).toHaveLength(0);
+        } finally {
+          deleteAutoQueue(currentId);
+          deleteAutoQueue(externalId);
+          deleteToolQueue(currentId);
+          deleteToolQueue(externalId);
+        }
+      });
+    });
+  });
+
   describe("toggle-retain subcommand", () => {
     it("toggles retention off, deletes queue files", async () => {
       const sessionId = "test-session-123";
