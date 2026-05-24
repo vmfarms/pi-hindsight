@@ -216,6 +216,15 @@ export function deleteToolQueue(sessionId: string): void {
 }
 
 /**
+ * Delete both queue files (auto + tool) for a session. Used by gate transitions
+ * that remove a session from the retention pipeline (discard / successful promote).
+ */
+export function deleteQueuesForSession(sessionId: string): void {
+  deleteAutoQueue(sessionId);
+  deleteToolQueue(sessionId);
+}
+
+/**
  * Check if an auto-queue exists for a session.
  */
 export function autoQueueExists(sessionId: string): boolean {

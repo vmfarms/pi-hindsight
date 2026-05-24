@@ -56,6 +56,10 @@ export const testConfig: HindsightConfig = {
   statusHealthy: "🧠",
   retainSessionsByDefault: true,
   statusUnhealthy: "🤯",
+  // Default tests to gate=off so existing flow tests (toggle-retain, parse,
+  // queue, etc.) keep their pre-L1 semantics. Gate-specific tests construct
+  // their own configs with mode="interactive-menu".
+  retentionGate: { mode: "off", reviewQueuePath: null, discardedPath: null },
 };
 
 /** Config with all retainContent types enabled (assistant: text+thinking+toolCall, user: text, toolResult: text). */

@@ -73,6 +73,30 @@ export type ToolName = "retain" | "recall" | "reflect";
 
 const VALID_TOOL_NAMES: ToolName[] = ["retain", "recall", "reflect"];
 
+/**
+ * Retention-gate mode (RFC §9).
+ *   off              — chokepoint guard short-circuits; flush behaves as pre-L1.
+ *   interactive-menu — operator decides via /hindsight session subcommands;
+ *                      pending sessions default-defer on shutdown.
+ *   autonomous-defer — worker decides; pending sessions default-defer on shutdown
+ *                      and the worker picks them up out-of-band.
+ */
+export type RetentionGateMode = "off" | "interactive-menu" | "autonomous-defer";
+
+export interface RetentionGateConfig {
+  mode: RetentionGateMode;
+  /** Absolute path for held sessions. `null` → <agentDir>/extensions/pi-hindsight/review-queue/ */
+  reviewQueuePath: string | null;
+  /** Absolute path for discarded sessions. `null` → <agentDir>/extensions/pi-hindsight/discarded/ */
+  discardedPath: string | null;
+}
+
+const VALID_RETENTION_GATE_MODES: RetentionGateMode[] = [
+  "off",
+  "interactive-menu",
+  "autonomous-defer",
+];
+
 export interface HindsightConfig {
   enabled: boolean;
   apiUrl: string;
@@ -111,6 +135,7 @@ export interface HindsightConfig {
   observationScopes: ObservationScopes;
   statusHealthy: string;
   statusUnhealthy: string;
+  retentionGate: RetentionGateConfig;
 }
 
 const VALID_MEMORY_TYPES = ["world", "experience", "observation"] as const;
@@ -175,6 +200,11 @@ const DEFAULT_CONFIG: HindsightConfig = {
   observationScopes: null,
   statusHealthy: "🧠",
   statusUnhealthy: "🤯",
+  retentionGate: {
+    mode: "interactive-menu",
+    reviewQueuePath: null,
+    discardedPath: null,
+  },
 };
 
 // Config keys that can be set via env vars or config file
@@ -216,6 +246,7 @@ const VALID_CONFIG_KEYS = new Set<keyof HindsightConfig>([
   "observationScopes",
   "statusHealthy",
   "statusUnhealthy",
+  "retentionGate",
 ]);
 
 function parseBoolean(
@@ -800,6 +831,44 @@ function setConfigValue(
     case "statusUnhealthy":
       config[key] = String(value);
       return;
+    case "retentionGate": {
+      // Accept either an object (from config file) or a JSON string (from env var).
+      // Unknown keys are ignored with a warning; invalid mode resets to default.
+      let parsed: unknown = value;
+      if (typeof value === "string") {
+        try {
+          parsed = JSON.parse(value);
+        } catch {
+          config[key] = DEFAULT_CONFIG[key];
+          return "retentionGate contains invalid JSON. Using default.";
+        }
+      }
+      if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+        config[key] = DEFAULT_CONFIG[key];
+        return `retentionGate must be an object, got ${Array.isArray(parsed) ? "array" : typeof parsed}. Using default.`;
+      }
+      const obj = parsed as Record<string, unknown>;
+      const next: RetentionGateConfig = { ...DEFAULT_CONFIG[key] };
+      let modeWarning: string | undefined;
+      if ("mode" in obj) {
+        const m = obj.mode;
+        if (typeof m === "string" && VALID_RETENTION_GATE_MODES.includes(m as RetentionGateMode)) {
+          next.mode = m as RetentionGateMode;
+        } else {
+          modeWarning = `retentionGate.mode invalid: ${JSON.stringify(m)}. Valid: ${VALID_RETENTION_GATE_MODES.join(", ")}. Using default: ${next.mode}.`;
+        }
+      }
+      if ("reviewQueuePath" in obj) {
+        const p = obj.reviewQueuePath;
+        next.reviewQueuePath = p === null ? null : typeof p === "string" ? p : null;
+      }
+      if ("discardedPath" in obj) {
+        const p = obj.discardedPath;
+        next.discardedPath = p === null ? null : typeof p === "string" ? p : null;
+      }
+      config[key] = next;
+      return modeWarning;
+    }
     default: {
       // This should never happen if VALID_CONFIG_KEYS is correct
       const _exhaustive: never = key;
@@ -1134,6 +1203,7 @@ export function loadConfig(extensionsDir?: string): {
     PI_HINDSIGHT_OBSERVATION_SCOPES: "observationScopes",
     PI_HINDSIGHT_STATUS_HEALTHY: "statusHealthy",
     PI_HINDSIGHT_STATUS_UNHEALTHY: "statusUnhealthy",
+    PI_HINDSIGHT_RETENTION_GATE: "retentionGate",
   };
 
   const envVars: string[] = [];
@@ -1144,6 +1214,40 @@ export function loadConfig(extensionsDir?: string): {
       const warning = setConfigValue(config, configKey, value);
       if (warning) warnings.push(warning);
     }
+  }
+
+  // Per-subfield retention-gate env vars (applied on top of any JSON blob from
+  // PI_HINDSIGHT_RETENTION_GATE). Each one overrides just its slice of the
+  // retentionGate object so operators can flip mode without restating the rest.
+  const gateModeEnv = process.env.PI_HINDSIGHT_RETENTION_GATE_MODE;
+  if (gateModeEnv !== undefined) {
+    envVars.push("PI_HINDSIGHT_RETENTION_GATE_MODE");
+    if (VALID_RETENTION_GATE_MODES.includes(gateModeEnv as RetentionGateMode)) {
+      config.retentionGate = {
+        ...config.retentionGate,
+        mode: gateModeEnv as RetentionGateMode,
+      };
+    } else {
+      warnings.push(
+        `PI_HINDSIGHT_RETENTION_GATE_MODE invalid: "${gateModeEnv}". Valid: ${VALID_RETENTION_GATE_MODES.join(", ")}. Ignored.`
+      );
+    }
+  }
+  const gateReviewEnv = process.env.PI_HINDSIGHT_RETENTION_GATE_REVIEW_QUEUE;
+  if (gateReviewEnv !== undefined) {
+    envVars.push("PI_HINDSIGHT_RETENTION_GATE_REVIEW_QUEUE");
+    config.retentionGate = {
+      ...config.retentionGate,
+      reviewQueuePath: gateReviewEnv === "" ? null : gateReviewEnv,
+    };
+  }
+  const gateDiscardedEnv = process.env.PI_HINDSIGHT_RETENTION_GATE_DISCARDED;
+  if (gateDiscardedEnv !== undefined) {
+    envVars.push("PI_HINDSIGHT_RETENTION_GATE_DISCARDED");
+    config.retentionGate = {
+      ...config.retentionGate,
+      discardedPath: gateDiscardedEnv === "" ? null : gateDiscardedEnv,
+    };
   }
 
   // Backward compat: fallback to old env var names if the new ones weren't set
